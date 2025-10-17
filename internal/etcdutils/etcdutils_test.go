@@ -60,7 +60,7 @@ func TestMemberList(t *testing.T) {
 		assert.NoError(t, err)
 
 		eps := []string{"http://localhost:2379"}
-		resp, err := MemberList(eps)
+		resp, err := MemberList(eps, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, resp)
 		assert.Greater(t, len(resp.Members), 0)
@@ -68,7 +68,7 @@ func TestMemberList(t *testing.T) {
 
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
-		resp, err := MemberList(eps)
+		resp, err := MemberList(eps, nil)
 		assert.Error(t, err)
 		assert.Nil(t, resp)
 	})
@@ -80,7 +80,7 @@ func TestClusterHealth(t *testing.T) {
 
 	t.Run("ReturnsHealthStatus", func(t *testing.T) {
 		eps := []string{"http://localhost:2379"}
-		health, err := ClusterHealth(eps)
+		health, err := ClusterHealth(eps, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, health)
 		assert.Greater(t, len(health), 0)
@@ -89,7 +89,7 @@ func TestClusterHealth(t *testing.T) {
 
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
-		health, err := ClusterHealth(eps)
+		health, err := ClusterHealth(eps, nil)
 		assert.NoError(t, err)
 		assert.Equal(t, "http://invalid:2379", health[0].Ep)
 		assert.Equal(t, false, health[0].Health)
@@ -104,7 +104,7 @@ func TestAddMember(t *testing.T) {
 	t.Run("AddsNewMember", func(t *testing.T) {
 		eps := []string{"http://localhost:2379"}
 		peerURLs := []string{"http://127.0.0.1:2380"}
-		resp, err := AddMember(eps, peerURLs, false)
+		resp, err := AddMember(eps, peerURLs, false, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, resp)
 		assert.Greater(t, len(resp.Members), 0)
@@ -113,7 +113,7 @@ func TestAddMember(t *testing.T) {
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
 		peerURLs := []string{"http://127.0.0.1:2380"}
-		resp, err := AddMember(eps, peerURLs, false)
+		resp, err := AddMember(eps, peerURLs, false, nil)
 		assert.Error(t, err)
 		assert.Nil(t, resp)
 	})
@@ -126,17 +126,17 @@ func TestPromoteLearner(t *testing.T) {
 	t.Run("PromotesMember", func(t *testing.T) {
 		eps := []string{"http://localhost:2379"}
 		peerURLs := []string{"http://test123:2380"}
-		addResp, err := AddMember(eps, peerURLs, true)
+		addResp, err := AddMember(eps, peerURLs, true, nil)
 		assert.NoError(t, err)
 
-		err = PromoteLearner(eps, addResp.Member.ID)
+		err = PromoteLearner(eps, addResp.Member.ID, nil)
 		assert.Error(t, err)
 		assert.Equal(t, err.Error(), "etcdserver: can only promote a learner member which is in sync with leader")
 	})
 
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
-		err := PromoteLearner(eps, 12345)
+		err := PromoteLearner(eps, 12345, nil)
 		assert.Error(t, err)
 	})
 }
@@ -147,7 +147,7 @@ func TestRemoveMember(t *testing.T) {
 
 	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
 		eps := []string{"http://invalid:2379"}
-		err := RemoveMember(eps, 12345)
+		err := RemoveMember(eps, 12345, nil)
 		assert.Error(t, err)
 	})
 }

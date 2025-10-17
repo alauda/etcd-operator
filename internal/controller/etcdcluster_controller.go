@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"time"
 
@@ -54,6 +55,7 @@ type EtcdClusterReconciler struct {
 type reconcileState struct {
 	cluster        *ecv1alpha1.EtcdCluster      // cluster custom resource currently being reconciled
 	sts            *appsv1.StatefulSet          // associated StatefulSet for the cluster
+	tlsConfig      *tls.Config                  // TLS configuration for the etcd cluster
 	memberListResp *clientv3.MemberListResponse // member list fetched from the etcd cluster
 	memberHealth   []etcdutils.EpHealth         // health information for each etcd member
 }
@@ -147,7 +149,12 @@ func (r *EtcdClusterReconciler) fetchAndValidateState(ctx context.Context, req c
 		}
 	}
 
-	return &reconcileState{cluster: ec, sts: sts}, ctrl.Result{}, nil
+	tlsConfig, err := getTlsConfig(ctx, r.Client, ec)
+	if err != nil {
+		return nil, ctrl.Result{}, err
+	}
+
+	return &reconcileState{cluster: ec, sts: sts, tlsConfig: tlsConfig}, ctrl.Result{}, nil
 }
 
 // bootstrapStatefulSet ensures that the foundational Kubernetes objects for
@@ -196,7 +203,7 @@ func (r *EtcdClusterReconciler) performHealthChecks(ctx context.Context, s *reco
 	logger := log.FromContext(ctx)
 	logger.Info("Now checking health of the cluster members")
 	var err error
-	s.memberListResp, s.memberHealth, err = healthCheck(s.sts, logger)
+	s.memberListResp, s.memberHealth, err = healthCheck(s.sts, logger, s.tlsConfig)
 	if err != nil {
 		return fmt.Errorf("health check failed: %w", err)
 	}
@@ -258,9 +265,9 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 			if etcdutils.IsLearnerReady(leaderStatus, learnerStatus) {
 				logger.Info("Learner is ready to be promoted to voting member", "learnerID", learner)
 				logger.Info("Promoting the learner member", "learnerID", learner)
-				eps := clientEndpointsFromStatefulsets(s.sts)
+				eps := clientEndpointsFromStatefulsets(s.sts, s.tlsConfig)
 				eps = eps[:(len(eps) - 1)]
-				if err := etcdutils.PromoteLearner(eps, learner); err != nil {
+				if err := etcdutils.PromoteLearner(eps, learner, s.tlsConfig); err != nil {
 					// The member is not promoted yet, so we error out and requeue via the caller.
 					return ctrl.Result{}, err
 				}
@@ -277,7 +284,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 		return ctrl.Result{}, nil
 	}
 
-	eps := clientEndpointsFromStatefulsets(s.sts)
+	eps := clientEndpointsFromStatefulsets(s.sts, s.tlsConfig)
 
 	// If there are no learners left, we can proceed to scale the cluster towards the desired size.
 	// When there are no members to add, the controller will requeue above and this block won't execute.
@@ -286,7 +293,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 		_, peerURL := peerEndpointForOrdinalIndex(s.cluster, int(targetReplica))
 		targetReplica++
 		logger.Info("[Scale out] adding a new learner member to etcd cluster", "peerURLs", peerURL)
-		if _, err := etcdutils.AddMember(eps, []string{peerURL}, true); err != nil {
+		if _, err := etcdutils.AddMember(eps, []string{peerURL}, true, s.tlsConfig); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -308,7 +315,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 
 		logger.Info("[Scale in] removing one member", "memberID", memberID)
 		eps = eps[:targetReplica]
-		if err := etcdutils.RemoveMember(eps, memberID); err != nil {
+		if err := etcdutils.RemoveMember(eps, memberID, s.tlsConfig); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -320,7 +327,7 @@ func (r *EtcdClusterReconciler) reconcileClusterState(ctx context.Context, s *re
 	}
 
 	// Ensure every etcd member reports itself healthy before declaring success.
-	allMembersHealthy, err := areAllMembersHealthy(s.sts, logger)
+	allMembersHealthy, err := areAllMembersHealthy(s.sts, logger, s.tlsConfig)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

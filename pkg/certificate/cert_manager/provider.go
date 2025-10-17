@@ -18,10 +18,12 @@ import (
 
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	cmmeta "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	ecv1alpha1 "go.etcd.io/etcd-operator/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	interfaces "go.etcd.io/etcd-operator/pkg/certificate/interfaces"
 )
@@ -33,13 +35,15 @@ const (
 
 type CertManagerProvider struct {
 	client.Client
+	etcdCluster *ecv1alpha1.EtcdCluster
 }
 
 var _ interfaces.Provider = (*CertManagerProvider)(nil)
 
-func New(c client.Client) interfaces.Provider {
+func New(c client.Client, ec *ecv1alpha1.EtcdCluster) interfaces.Provider {
 	return &CertManagerProvider{
 		c,
+		ec,
 	}
 }
 
@@ -97,6 +101,38 @@ func (cm *CertManagerProvider) EnsureCertificateSecret(ctx context.Context, secr
 
 	log.Printf("Valid certificate secret: %s already present in namespace: %s", secretName, namespace)
 	return nil
+}
+
+func (cm *CertManagerProvider) GetCertificateContent(ctx context.Context, secretName, namespace string) (*interfaces.CertificateContent, error) {
+	secret := &corev1.Secret{}
+	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret)
+	if err != nil {
+		return nil, err
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	caCertificateData, exists := secret.Data["ca.crt"]
+	if !exists {
+		return nil, interfaces.ErrTLSCert
+	}
+
+	certificateData, exists := secret.Data["tls.crt"]
+	if !exists {
+		return nil, interfaces.ErrTLSCert
+	}
+
+	privateKeyData, keyExists := secret.Data["tls.key"]
+	if !keyExists {
+		return nil, interfaces.ErrTLSKey
+	}
+
+	return &interfaces.CertificateContent{
+		CaCertificate: caCertificateData,
+		Certificate:   certificateData,
+		PrivateKey:    privateKeyData,
+	}, nil
 }
 
 func (cm *CertManagerProvider) ValidateCertificateSecret(ctx context.Context, secretName, namespace string,
@@ -334,6 +370,10 @@ func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretName
 			},
 			Duration: &metav1.Duration{Duration: cfg.ValidityDuration},
 		},
+	}
+
+	if err := controllerutil.SetControllerReference(cm.etcdCluster, certificateResource, cm.Scheme()); err != nil {
+		return err
 	}
 
 	return cm.Create(ctx, certificateResource)

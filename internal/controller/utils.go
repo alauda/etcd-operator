@@ -2,11 +2,12 @@ package controller
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log"
 	"maps"
-	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -77,10 +78,32 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 func defaultArgs(name string) []string {
 	return []string{
 		"--name=$(POD_NAME)",
+
 		"--listen-peer-urls=http://0.0.0.0:2380",   // TODO: only listen on 127.0.0.1 and host IP
 		"--listen-client-urls=http://0.0.0.0:2379", // TODO: only listen on 127.0.0.1 and host IP
 		fmt.Sprintf("--initial-advertise-peer-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2380", name),
 		fmt.Sprintf("--advertise-client-urls=http://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2379", name),
+	}
+}
+
+func defaultTLSArgs(name string) []string {
+	return []string{
+		"--name=$(POD_NAME)",
+
+		"--listen-peer-urls=https://0.0.0.0:2380",   // TODO: only listen on 127.0.0.1 and host IP
+		"--listen-client-urls=https://0.0.0.0:2379", // TODO: only listen on 127.0.0.1 and host IP
+		fmt.Sprintf("--initial-advertise-peer-urls=https://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2380", name),
+		fmt.Sprintf("--advertise-client-urls=https://$(POD_NAME).%s.$(POD_NAMESPACE).svc.cluster.local:2379", name),
+
+		"--client-cert-auth",
+		"--trusted-ca-file=/etc/etcd/certs/server/ca.crt",
+		"--cert-file=/etc/etcd/certs/server/tls.crt",
+		"--key-file=/etc/etcd/certs/server/tls.key",
+
+		"--peer-client-cert-auth",
+		"--peer-trusted-ca-file=/etc/etcd/certs/peer/ca.crt",
+		"--peer-cert-file=/etc/etcd/certs/peer/tls.crt",
+		"--peer-key-file=/etc/etcd/certs/peer/tls.key",
 	}
 }
 
@@ -111,8 +134,11 @@ func getArgName(s string) string {
 	return strings.TrimSpace(s)
 }
 
-func createArgs(name string, etcdOptions []string) []string {
+func createArgs(name string, etcdOptions []string, tls bool) []string {
 	defaultArgs := defaultArgs(name)
+	if tls {
+		defaultArgs = defaultTLSArgs(name)
+	}
 	if len(etcdOptions) > 0 {
 		var argName string
 		// Remove default arguments if conflicts with user supplied
@@ -143,7 +169,7 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 			{
 				Name:    "etcd",
 				Command: []string{"/usr/local/bin/etcd"},
-				Args:    createArgs(ec.Name, ec.Spec.EtcdOptions),
+				Args:    createArgs(ec.Name, ec.Spec.EtcdOptions, ec.Spec.TLS != nil),
 				Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version),
 				Env: []corev1.EnvVar{
 					{
@@ -204,6 +230,19 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 			},
 		}
 		certVolume = append(certVolume, serverCertVolume, peerCertVolume)
+
+		certVolumeMount := []corev1.VolumeMount{
+			{
+				Name:      "server-secret",
+				MountPath: "/etc/etcd/certs/server",
+			},
+			{
+				Name:      "peer-secret",
+				MountPath: "/etc/etcd/certs/peer",
+			},
+		}
+
+		podSpec.Containers[0].VolumeMounts = append(podSpec.Containers[0].VolumeMounts, certVolumeMount...)
 	}
 	if len(certVolume) != 0 {
 		podSpec.Volumes = certVolume
@@ -244,12 +283,12 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 	}
 
 	if ec.Spec.StorageSpec != nil {
-
-		stsSpec.Template.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{
+		stsSpec.Template.Spec.Containers[0].VolumeMounts = append(stsSpec.Template.Spec.Containers[0].VolumeMounts, corev1.VolumeMount{
 			Name:        volumeName,
 			MountPath:   etcdDataDir,
 			SubPathExpr: "$(POD_NAME)",
-		}}
+		})
+
 		// Create a new volume claim template
 		if ec.Spec.StorageSpec.VolumeSizeRequest.Cmp(resource.MustParse("1Mi")) < 0 {
 			return fmt.Errorf("VolumeSizeRequest must be at least 1Mi")
@@ -380,8 +419,9 @@ func createHeadlessServiceIfNotExist(ctx context.Context, logger logr.Logger, c 
 					Labels:    labels,
 				},
 				Spec: corev1.ServiceSpec{
-					ClusterIP: "None", // Key for headless service
-					Selector:  labels,
+					ClusterIP:                "None", // Key for headless service
+					Selector:                 labels,
+					PublishNotReadyAddresses: true,
 				},
 			}
 
@@ -415,8 +455,12 @@ func configMapNameForEtcdCluster(ec *ecv1alpha1.EtcdCluster) string {
 
 func peerEndpointForOrdinalIndex(ec *ecv1alpha1.EtcdCluster, index int) (string, string) {
 	name := fmt.Sprintf("%s-%d", ec.Name, index)
-	return name, fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local:2380",
-		ec.Name, index, ec.Name, ec.Namespace)
+	uriScheme := "http"
+	if ec.Spec.TLS != nil {
+		uriScheme = "https"
+	}
+	return name, fmt.Sprintf("%s://%s-%d.%s.%s.svc.cluster.local:2380",
+		uriScheme, ec.Name, index, ec.Name, ec.Namespace)
 }
 
 func newEtcdClusterState(ec *ecv1alpha1.EtcdCluster, replica int) *corev1.ConfigMap {
@@ -469,9 +513,18 @@ func applyEtcdClusterState(ctx context.Context, ec *ecv1alpha1.EtcdCluster, repl
 	return updateErr
 }
 
-func clientEndpointForOrdinalIndex(sts *appsv1.StatefulSet, index int) string {
-	return fmt.Sprintf("http://%s-%d.%s.%s.svc.cluster.local:2379",
-		sts.Name, index, sts.Name, sts.Namespace)
+func clientEndpointForOrdinalIndex(sts *appsv1.StatefulSet, index int, tlsConfig *tls.Config) string {
+	uriScheme := "http"
+	if tlsConfig != nil {
+		uriScheme = "https"
+	}
+	return fmt.Sprintf("%s://%s-%d.%s.%s.svc.cluster.local:2379",
+		uriScheme,
+		sts.Name,
+		index,
+		sts.Name,
+		sts.Namespace,
+	)
 }
 
 func getStatefulSet(ctx context.Context, c client.Client, name, namespace string) (*appsv1.StatefulSet, error) {
@@ -483,19 +536,19 @@ func getStatefulSet(ctx context.Context, c client.Client, name, namespace string
 	return sts, nil
 }
 
-func clientEndpointsFromStatefulsets(sts *appsv1.StatefulSet) []string {
+func clientEndpointsFromStatefulsets(sts *appsv1.StatefulSet, tlsConfig *tls.Config) []string {
 	var endpoints []string
 	replica := int(*sts.Spec.Replicas)
 	if replica > 0 {
 		for i := 0; i < replica; i++ {
-			endpoints = append(endpoints, clientEndpointForOrdinalIndex(sts, i))
+			endpoints = append(endpoints, clientEndpointForOrdinalIndex(sts, i, tlsConfig))
 		}
 	}
 	return endpoints
 }
 
-func areAllMembersHealthy(sts *appsv1.StatefulSet, logger logr.Logger) (bool, error) {
-	_, health, err := healthCheck(sts, logger)
+func areAllMembersHealthy(sts *appsv1.StatefulSet, logger logr.Logger, tlsConfig *tls.Config) (bool, error) {
+	_, health, err := healthCheck(sts, logger, tlsConfig)
 	if err != nil {
 		return false, err
 	}
@@ -511,15 +564,15 @@ func areAllMembersHealthy(sts *appsv1.StatefulSet, logger logr.Logger) (bool, er
 // healthCheck returns a memberList and an error.
 // If any member (excluding not yet started or already removed member)
 // is unhealthy, the error won't be nil.
-func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListResponse, []etcdutils.EpHealth, error) {
+func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger, tlsConfig *tls.Config) (*clientv3.MemberListResponse, []etcdutils.EpHealth, error) {
 	replica := int(*sts.Spec.Replicas)
 	if replica == 0 {
 		return nil, nil, nil
 	}
 
-	endpoints := clientEndpointsFromStatefulsets(sts)
+	endpoints := clientEndpointsFromStatefulsets(sts, tlsConfig)
 
-	memberlistResp, err := etcdutils.MemberList(endpoints)
+	memberlistResp, err := etcdutils.MemberList(endpoints, tlsConfig)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -535,7 +588,7 @@ func healthCheck(sts *appsv1.StatefulSet, lg klog.Logger) (*clientv3.MemberListR
 	lg.Info("health checking", "replica", replica, "len(members)", memberCnt)
 	endpoints = endpoints[:cnt]
 
-	healthInfos, err := etcdutils.ClusterHealth(endpoints)
+	healthInfos, err := etcdutils.ClusterHealth(endpoints, tlsConfig)
 	if err != nil {
 		return memberlistResp, nil, err
 	}
@@ -577,10 +630,9 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config
 	if cmConfig.AltNames.DNSNames != nil {
 		getAltNames = certInterface.AltNames{
 			DNSNames: cmConfig.AltNames.DNSNames,
-			IPs:      make([]net.IP, len(cmConfig.AltNames.DNSNames)),
 		}
 	} else {
-		defaultDNSNames := []string{fmt.Sprintf("%s.svc.cluster.local", cmConfig.CommonName)}
+		defaultDNSNames := []string{fmt.Sprintf("*.%s.%s.svc.cluster.local", ec.Name, ec.Namespace)}
 		getAltNames = certInterface.AltNames{
 			DNSNames: defaultDNSNames,
 		}
@@ -605,8 +657,30 @@ func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Conf
 	return config
 }
 
+func getCertificatesContent(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster, certName string) (*certInterface.CertificateContent, error) {
+	cert, err := certificate.NewProvider(certificate.ProviderType(ec.Spec.TLS.Provider), c, ec)
+	if err != nil {
+		// TODO: instead of error, set default autoConfig
+		return nil, err
+	}
+
+	return cert.GetCertificateContent(ctx, certName, ec.Namespace)
+}
+
+func getClientCertificate(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster) (*certInterface.CertificateContent, error) {
+	return getCertificatesContent(ctx, c, ec, getClientCertName(ec.Name))
+}
+
+func getServerCertificate(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster) (*certInterface.CertificateContent, error) {
+	return getCertificatesContent(ctx, c, ec, getServerCertName(ec.Name))
+}
+
+func getPeerCertificate(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster) (*certInterface.CertificateContent, error) {
+	return getCertificatesContent(ctx, c, ec, getPeerCertName(ec.Name))
+}
+
 func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
-	cert, certErr := certificate.NewProvider(certificate.ProviderType(ec.Spec.TLS.Provider), c)
+	cert, certErr := certificate.NewProvider(certificate.ProviderType(ec.Spec.TLS.Provider), c, ec)
 	if certErr != nil {
 		// TODO: instead of error, set default autoConfig
 		return certErr
@@ -641,6 +715,32 @@ func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client
 	}
 
 	return nil
+}
+
+func getTlsConfig(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster) (*tls.Config, error) {
+	if ec.Spec.TLS != nil {
+		certs, err := getClientCertificate(ctx, c, ec)
+		if err != nil {
+			return nil, err
+		}
+
+		rootCAs := x509.NewCertPool()
+		if ok := rootCAs.AppendCertsFromPEM(certs.CaCertificate); !ok {
+			return nil, fmt.Errorf("error create root CA for the DB connector")
+		}
+
+		certificate, err := tls.X509KeyPair(certs.Certificate, certs.PrivateKey)
+		if err != nil {
+			return nil, err
+		}
+
+		return &tls.Config{
+			RootCAs:      rootCAs,
+			Certificates: []tls.Certificate{certificate},
+		}, nil
+	}
+
+	return nil, nil
 }
 
 func createClientCertificate(ctx context.Context, ec *ecv1alpha1.EtcdCluster, c client.Client) error {

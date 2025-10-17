@@ -196,7 +196,7 @@ func TestClientEndpointForOrdinalIndex(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("index %d", tt.index), func(t *testing.T) {
-			result := clientEndpointForOrdinalIndex(sts, tt.index)
+			result := clientEndpointForOrdinalIndex(sts, tt.index, nil)
 			assert.Equal(t, tt.expectedResult, result)
 		})
 	}
@@ -375,7 +375,7 @@ func TestClientEndpointsFromStatefulsets(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := clientEndpointsFromStatefulsets(tt.statefulSet)
+			result := clientEndpointsFromStatefulsets(tt.statefulSet, nil)
 			assert.Equal(t, tt.expectedResult, result)
 		})
 	}
@@ -414,7 +414,7 @@ func TestAreAllMembersHealthy(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			logger := logr.Discard() // Use a no-op logger for testing
 
-			result, err := areAllMembersHealthy(tt.statefulSet, logger)
+			result, err := areAllMembersHealthy(tt.statefulSet, logger, nil)
 			assert.Equal(t, tt.expectedResult, result)
 			if tt.expectedError != nil {
 				assert.Error(t, err)
@@ -768,7 +768,7 @@ func TestCreatingArgs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.testName, func(t *testing.T) {
-			result := createArgs(tt.clusterName, tt.etcdOptions)
+			result := createArgs(tt.clusterName, tt.etcdOptions, false)
 			assert.Equal(t, tt.expectedResult, result)
 		})
 	}

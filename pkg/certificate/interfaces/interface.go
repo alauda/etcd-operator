@@ -63,6 +63,12 @@ type Config struct {
 	ExtraConfig map[string]any
 }
 
+type CertificateContent struct {
+	CaCertificate []byte
+	Certificate   []byte
+	PrivateKey    []byte
+}
+
 type Provider interface {
 	// EnsureCertificateSecret ensures the specified certificate is
 	// available as a Secret in Kubernetes. If the Secret does not
@@ -126,4 +132,15 @@ type Provider interface {
 	// Returns:
 	// - Config if the Secret exists and is valid, or an error otherwise.
 	GetCertificateConfig(ctx context.Context, secretName string, namespace string) (*Config, error)
+
+	// GetCertificate returns the certificate from the provider.
+	//
+	// Parameters:
+	// - ctx: Context for cancellation and deadlines.
+	// - secretName: Name of the Secret containing the certificate.
+	// - namespace: Namespace where the Secret resides.
+	//
+	// Returns:
+	// - Certificate if the Secret exists and is valid, or an error otherwise.
+	GetCertificateContent(ctx context.Context, secretName string, namespace string) (*CertificateContent, error)
 }
