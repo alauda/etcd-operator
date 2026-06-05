@@ -92,9 +92,12 @@ status:
     - { name: branch-a-etcd-0, id: "abc", healthy: true, leader: true, learner: false, nodeName: node-a }
   recovery: { active: false, lastResult: Succeeded, lastRecoveredMember: branch-a-etcd-2 }
   conditions:
-    - { type: Available,        status: "True" }   # member 就绪、达到 spec.size
-    - { type: QuorumAvailable,  status: "True" }   # healthy member 满足 quorum
-    - { type: RecoveryActive,   status: "False" }  # True=单 member 恢复进行中
+    - { type: EtcdClusterCreated,          status: "True" }
+    - { type: EtcdClusterReady,            status: "True" }
+    - { type: DataStoreReady,              status: "True" }
+    - { type: QuorumAvailable,            status: "True" }
+    - { type: SingleMemberDegraded,        status: "False" }
+    - { type: SingleMemberRecoveryActive,  status: "False" }
 ```
 
 ### 5.2 etcd 就绪探针
@@ -116,9 +119,7 @@ status:
 
 ### 5.4 PDB
 
-按 size 生成（3 → `maxUnavailable:1`），drain 时一次只动一个 member。
-
-**不照搬 `unhealthyPodEvictionPolicy:AlwaysAllow`**：它放行驱逐未就绪 pod，依赖准确的健康判定（§5.2）。探针补齐前用它可能驱逐仍在 quorum 的 member、丢 quorum。保留默认 `IfHealthyBudget`。代价：member 真卡死且 budget 耗尽时 drain 被挡、需人工介入；待探针可靠后再评估放开。
+按 size 生成（3 → `maxUnavailable:1`），并与 OCP 对齐设置 `unhealthyPodEvictionPolicy: AlwaysAllow`：健康 member 仍受 budget 约束；NotReady / 卡死 member 可在 drain 时被驱逐，避免节点维护被永久阻塞。前提是 §5.2 探针可靠；quorum 与恢复准入仍由 controller 侧 member health 判断，不只看 Pod Ready。
 
 ### 5.5 单 member 自动恢复
 
@@ -199,9 +200,156 @@ sequenceDiagram
 **检测（两段式，对齐 OCP）**：
 
 - **触发**（controller，纯看 k8s 状态）：某个 etcd pod 的容器进入 CrashLoopBackOff（`State.Waiting` 且 `RestartCount>0`）即触发——不连 etcd、不扒日志。
-- **确认**（recovery Job，连 etcd）：Job 起来后查 `MemberList`（哪个 member 缺失）+ 逐 member `Get("health")` 与 `AlarmList`（`NOSPACE`/`CORRUPT` 即数据损坏）+ 再看 failing pod。任一成立判为 unhealthy。
+- **确认**（recovery Job，连 etcd）：Job 起来后查 `MemberList`（哪个 member 缺失）+ 逐 member `Get("health")` 与 `AlarmList`（`NOSPACE` 为空间告警、`CORRUPT` 为数据损坏）+ 再看 failing pod。任一成立判为 unhealthy。
 
 > 判健康用的是 **pod 重启状态 + etcd alarm**，不是 §5.2 的就绪探针（那个给 PDB/drain 用）。OCP 触发即动手、无 grace period；我们额外加 `gracePeriod` 去抖，避免把节点 reboot / 短暂 drain 误判为故障。
+
+<details>
+<summary>Job YAML 示例</summary>
+
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: etcd-health-check
+  namespace: hcp-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: etcd-health-check
+  namespace: hcp-system
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: etcd-health-check
+  namespace: hcp-system
+subjects:
+  - kind: ServiceAccount
+    name: etcd-health-check
+    namespace: hcp-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: etcd-health-check
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: etcd-health-check
+  namespace: hcp-system
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: etcd-health-check
+      containers:
+        - name: check
+          # 示例镜像需同时包含 etcdctl 与 kubectl。
+          image: your-image-with-etcdctl-and-kubectl:latest
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+
+              export ETCDCTL_API=3
+              unhealthy=0
+
+              etcdctl_one() {
+                local ep="$1"
+                shift
+                etcdctl \
+                  --endpoints="${ep}" \
+                  --cacert="${ETCDCTL_CACERT}" \
+                  --cert="${ETCDCTL_CERT}" \
+                  --key="${ETCDCTL_KEY}" \
+                  "$@"
+              }
+
+              echo "== etcd health/alarm check =="
+              for i in $(seq 0 $((ETCD_REPLICAS - 1))); do
+                ep="${ETCD_SCHEME}://${ETCD_STS_NAME}-${i}.${ETCD_HEADLESS_SERVICE}.${ETCD_NAMESPACE}.svc.cluster.local:2379"
+                echo "checking ${ep}"
+
+                if ! etcdctl_one "${ep}" get health --consistency=s >/dev/null; then
+                  echo "[UNHEALTHY] Get(\"health\") failed on ${ep}"
+                  unhealthy=1
+                fi
+
+                if ! alarm_out="$(etcdctl_one "${ep}" alarm list 2>&1)"; then
+                  echo "[UNHEALTHY] AlarmList failed on ${ep}"
+                  echo "${alarm_out}"
+                  unhealthy=1
+                elif echo "${alarm_out}" | grep -E '\b(NOSPACE|CORRUPT)\b' >/dev/null; then
+                  echo "[UNHEALTHY] critical alarm found on ${ep}:"
+                  echo "${alarm_out}"
+                  unhealthy=1
+                fi
+              done
+
+              echo "== pod check =="
+              if ! pod_lines="$(kubectl -n "${ETCD_NAMESPACE}" get pods -l "${ETCD_POD_SELECTOR}" --no-headers 2>&1)"; then
+                echo "[UNHEALTHY] failed to list etcd pods"
+                echo "${pod_lines}"
+                unhealthy=1
+              else
+                bad_pods="$(
+                  echo "${pod_lines}" | awk '
+                    {
+                      split($2, ready, "/")
+                      if ($3 != "Running" || ready[1] != ready[2]) print $0
+                    }
+                  '
+                )"
+                if [[ -n "${bad_pods}" ]]; then
+                  echo "[UNHEALTHY] failing/unready pods:"
+                  echo "${bad_pods}"
+                  unhealthy=1
+                fi
+              fi
+
+              if [[ "${unhealthy}" -ne 0 ]]; then
+                echo "RESULT: unhealthy"
+                exit 1
+              fi
+              echo "RESULT: healthy"
+          env:
+            - name: ETCD_NAMESPACE
+              value: hcp-system
+            - name: ETCD_STS_NAME
+              value: branch-a-etcd
+            - name: ETCD_HEADLESS_SERVICE
+              value: branch-a-etcd
+            - name: ETCD_REPLICAS
+              value: "3"
+            - name: ETCD_SCHEME
+              value: https
+            - name: ETCD_POD_SELECTOR
+              value: app.kubernetes.io/instance=branch-a-etcd
+            - name: ETCDCTL_CACERT
+              value: /etc/etcd/tls/ca.crt
+            - name: ETCDCTL_CERT
+              value: /etc/etcd/tls/tls.crt
+            - name: ETCDCTL_KEY
+              value: /etc/etcd/tls/tls.key
+          volumeMounts:
+            - name: etcd-client-tls
+              mountPath: /etc/etcd/tls
+              readOnly: true
+      volumes:
+        - name: etcd-client-tls
+          secret:
+            secretName: branch-a-etcd-client-tls
+```
+
+</details>
 
 **守卫**：仅当 quorum 可用、恰好 1 member 异常（最多 1 个 failing pod；3 member 时 unhealthy ≤1）、且无并发 scale/upgrade（STS 不在滚动更新）时才恢复。
 
