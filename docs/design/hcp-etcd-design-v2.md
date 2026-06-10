@@ -47,13 +47,25 @@ ACP Hosted Control Plane（**ACP HCP**）是 Alauda 基于 Kamaji 和 Cluster AP
 
 **4. 升级超时（>2h 未完成）需人工介入。** 取舍是宁可让升级一直等，也绝不冒丢 quorum 的风险。如某成员没就绪、PDB 不满足时，drain 的驱逐被一直拒绝、`Machine` 卡 `Deleting`、`MachineDeployment` 长期不 ready；而 **MD 没有超时自动报错（置 Failed）的机制**，需运维盯着，按「Machine → PDB → 哪个成员没就绪」排查。（§12.3）
 
-## 4. 对标：OCP 如何升级 HCP 管控面
+## 4. 对标：OCP 如何保证 etcd 生产可用
 
-**怎么升级。** HyperShift 里每个 hosted 控制面组件（含 etcd）都是 management 集群的 workload。升级分两层：组件自身版本滚动（换镜像、滚动重启 Pod）；承载它们的 management 节点走标准节点滚动升级——CVO 编排、MCO 逐个 drain / 替换节点 / 重启。
+HyperShift 把每个 hosted 控制面的 etcd 以 StatefulSet（默认 3 成员）跑在 management 集群。从四个方面看 OCP 怎么让它达到生产可用：
 
-**升级机制与普通节点相同、无特殊处理。** OCP 升级 HCP managed 节点和升级普通节点走的是同一套 CVO + MCO，对 HCP managed 节点没有任何特殊处理；节点 drain 受 PDB 约束也不是 etcd 独有的。
+**1. 部署（节点拓扑与隔离）。** management 节点拓扑分三挡，隔离强度递增：
 
-**OCP 的 etcd HA 机制**（3 成员 StatefulSet，下面几层保证滚动升级不丢 quorum）：
+| 档位 | 隔离强度 | 关键机制 |
+| --- | --- | --- |
+| Shared Everything | 无（默认） | 所有 hosted cluster 控制面 Pod 共享 management 节点 |
+| Shared Nothing | 节点级 | `hypershift.openshift.io/cluster` taint + label 把不同 hosted cluster 隔离到独占节点 |
+| Dedicated Request Serving | 节点 + zone 级 | 单个 hosted cluster 在 2 zone 各预留 1 节点，专门承载 kube-apiserver 等前端组件 |
+
+ACP 对应做法见 §8：用专用节点池 + label 把 etcd 隔离到 HCP 管控节点，相当于 Shared Nothing 这一挡。
+
+**2. HCP managed 节点升级。** 升级 HCP managed 节点和升级普通节点走的是同一套 CVO + MCO（CVO 编排、MCO 逐个 drain / 替换节点 / 重启），对 HCP managed 节点没有任何特殊处理；节点 drain 受 PDB 约束也不是 etcd 独有的。
+
+**3. etcd 版本升级。** etcd 版本随控制面 release 走：改 StatefulSet 镜像 → RollingUpdate 逐成员滚动、靠 readyz 串行；遵循 etcd 逐个 minor 递进、不跨 minor、基本不降级的约束。
+
+**4. etcd HA 机制**（3 成员 StatefulSet，下面几层保证节点滚动 / 维护时不丢 quorum）：
 
 | HA 机制 | OCP 做法 |
 | --- | --- |
@@ -65,7 +77,7 @@ ACP Hosted Control Plane（**ACP HCP**）是 Alauda 基于 Kamaji 和 Cluster AP
 | 成员级自愈 | `--enable-etcd-recovery`（默认开）：单个成员失败（quorum 还在）时删掉它的 PVC+Pod，重新供给空盘后由 `reset-member` initContainer 先 remove 再 add，干净地重新加入 |
 | 自动 defrag | 仅 HA 下运行 `etcd-defrag-controller`，一次只下线一个成员做整理 |
 
-后续以此表为基准盘点差距（§5）、给出改造（§8–§10）。
+后续以这四个方面为基准盘点差距（§5）、给出改造（§8–§10）。
 
 ## 5. 差距盘点
 
