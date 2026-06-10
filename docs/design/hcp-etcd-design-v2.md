@@ -11,7 +11,7 @@ ACP Hosted Control Plane（**ACP HCP**）是 Alauda 基于 Kamaji 和 Cluster AP
 - **etcd 版本安全升级**；
 - **etcd 备份与恢复**。
 
-本设计对标 OCP HCP（HyperShift，§4）：本期落地前三项的高可用能力，并提供备份恢复手册（etcd snapshot + Velero），自动化列入后续。范围见 §2。
+本设计对标 OCP HCP（HyperShift，§4）：本期落地前三项的高可用能力，并给出备份恢复方案（etcd snapshot + Velero），自动化与具体手册列入后续。范围见 §2。
 
 ## 2. Goal / Non-Goal
 
@@ -20,12 +20,13 @@ ACP Hosted Control Plane（**ACP HCP**）是 Alauda 基于 Kamaji 和 Cluster AP
 - `EtcdCluster` 从「能扩缩容」提升到「节点升级时高可用」。
 - 支持 etcd 版本升级。
 - 接入 Kamaji（发布 DataStore 供 hosted apiserver 连接）。
-- 提供备份恢复手册：etcd snapshot 备数据 + Velero 备控制面 namespace 资源（§13）。
+- 明确备份恢复方案：etcd snapshot 备数据 + Velero 备控制面 namespace 资源（§13）。
 
 **Non-Goal（本期不做，自动化见 §15）**
 
-- 备份 / 恢复**自动化**：定期快照调度、自动 restore（本期只给手册，§13）。
-- quorum 丢失后的**自动**恢复（手册见 §13.3）。
+- 备份 / 恢复**自动化**：定期快照调度、自动 restore（本期只定方案，§13）。
+- quorum 丢失后的**自动**恢复（恢复方案见 §13）。
+- 备份恢复的**具体操作手册**（命令 / 参数 / 对象存储配置）——单独整理。
 - TLS 证书自动轮换。
 - 自动 defrag。
 - 永久换机 / local PV 迁移（节点被永久替换、本地盘数据丢失后的重建）。
@@ -541,7 +542,7 @@ flowchart TD
 | 触发 | 现象 | 处置 |
 | --- | --- | --- |
 | **升级长时间未完成**（经验值：**>2h** MachineDeployment 仍未 fully ready） | MD `updatedReplicas`/`readyReplicas` 长期 < `replicas`。注意 **MD 没有「超时自动把 `status.phase` 置 `Failed`」的机制**（不像 ModuleInfo），它不会自己报错 | 看 **MD `status` + etcd-operator 日志**，顺着 §12.4：Machine `DrainingSucceeded` → PDB → 哪个 member 没就绪 |
-| **quorum 丢失（≥2 member 异常）** | `QuorumAvailable=False`；自愈只告警不动手 | 走 snapshot 恢复手册（§13.3），期间 API 不可用 |
+| **quorum 丢失（≥2 member 异常）** | `QuorumAvailable=False`；自愈只告警不动手 | 按 §13 恢复方案走 snapshot 恢复，期间 API 不可用 |
 | **节点 drain 长期卡住** | Machine 卡 `Deleting`、PDB `ALLOWED DISRUPTIONS=0` | 查其余 member 为何没 Ready；等 §11.2 自愈 / 人工修复，**切忌 force delete 跳过 PDB / 误设 `nodeDrainTimeout`** |
 | **recovery Job Failed** | `reason=RecoveryJobFailed`、不自动重试 | 看 Job 日志定位，手动修复后删 Job 重试 |
 | **数据盘没重挂** | reset-member 反复 `removing/Adding`、member 反复全量同步 | 查 Baremetal Provider 是否真复用了旧盘 / hostname（§8.2） |
@@ -554,72 +555,22 @@ flowchart TD
 - **节点升级不动**：先看 `kubectl get machines` 是否卡 Deleting、再看 `kubectl get pdb`（ALLOWED=0）、再看哪个 member 没 Ready（readyz）。
 - **alarm**：`NOSPACE` → 加盘 / defrag；`CORRUPT` → 该 member 走自愈重建（§11.2）。
 
-## 13. 备份与恢复（手册，对标 OCP）
+## 13. 备份与恢复（方案，对标 OCP）
 
-对标 OCP HCP 容灾思路，**两类分开备份**：
+> 本节只讨论**方案与思路**，对标 OCP HCP 的容灾做法；具体操作手册（命令、参数、对象存储配置等）另行单独整理，不在本设计内展开。
 
-- **etcd 数据**（key-value）：etcd snapshot；
-- **hosted 控制面 k8s 资源**（`EtcdCluster` CR、TLS Secret、ConfigMap、Kamaji `DataStore` 等）：**Velero** 备其所在 namespace。
+核心思路：**两类东西分开备份，恢复时配合**。
 
-恢复时先用 Velero 拉回资源、再用 snapshot 灌回数据。本期为**手册**（不做定期调度 / 自动 restore，自动化见 §15）。
+- **etcd 数据**（key-value）：用 **etcd snapshot** 备份（对标 OCP `etcdctl snapshot save`）。snapshot 只覆盖数据本身，不含证书 / CR 等资源。
+- **hosted 控制面的 k8s 资源**（`EtcdCluster` CR、TLS Secret、ConfigMap、Kamaji `DataStore` / TenantControlPlane 等）：用 **Velero** 备份它们所在的 namespace（对标 OCP 用 OADP，即 Velero，备份 hosted control plane）。
 
-> OCP 对应：etcd snapshot 见 HyperShift `etcd-snapshot-backup`；控制面资源用 OADP（Velero）——见 §16。
+**几个关键取舍**：
 
-### 13.1 备份 etcd 数据（etcd snapshot）
+- **证书必须纳入资源备份**：etcd 的 peer/server/client 证书（cert-manager 签发的 Secret）是 restore 后成员互信、apiserver 重连的前提，必须跟着 namespace 一起备。
+- **不用卷快照**：etcd 的 PV 是 TopoLVM 本地盘，跨节点卷快照不可靠也无必要——数据恢复一律走 etcd snapshot，Velero 只负责 k8s 资源。
+- **恢复顺序「先资源、后数据」**：先用 Velero 把 namespace 资源（含 `EtcdCluster` / 证书）拉回来，再用 snapshot 把 etcd 数据灌回去、由 operator 以 learner 逐个扩回 `size`（§11.1）——这也是 §2「quorum 丢失恢复」的落地路径。
 
-在任一健康成员上打快照、校验、拷出、上传对象存储（对标 OCP `etcdctl snapshot save`）：
-
-```sh
-NS=hcp-system
-ETCD=branch-a-etcd                 # StatefulSet 名
-POD=${ETCD}-0                      # 任一健康成员
-TLS=/etc/etcd/tls                  # 容器内证书挂载路径（同 <name>-client-tls）
-C=etcd                             # etcd 容器名，以实际 StatefulSet 为准
-
-# 1) 在 member pod 内打快照
-kubectl -n "$NS" exec "$POD" -c "$C" -- sh -c \
-  "ETCDCTL_API=3 etcdctl --endpoints=https://localhost:2379 \
-   --cacert=$TLS/ca.crt --cert=$TLS/tls.crt --key=$TLS/tls.key \
-   snapshot save /var/lib/etcd/snapshot.db"
-
-# 2) 校验快照（hash / revision / 大小）
-kubectl -n "$NS" exec "$POD" -c "$C" -- sh -c \
-  "ETCDCTL_API=3 etcdctl snapshot status /var/lib/etcd/snapshot.db -w table"
-
-# 3) 拷到本地，并清理 pod 内临时文件
-kubectl -n "$NS" cp "$POD:/var/lib/etcd/snapshot.db" "./${ETCD}.db" -c "$C"
-kubectl -n "$NS" exec "$POD" -c "$C" -- rm -f /var/lib/etcd/snapshot.db
-
-# 4) 上传对象存储（S3 / MinIO 等）：文件名带集群名 + 时间戳，按 retention 定期清理
-```
-
-snapshot 只覆盖**数据**，证书 / CR 等由 §13.2 负责。
-
-### 13.2 备份控制面资源（Velero）
-
-用 Velero 备 **HCP managed 集群（hosted 控制面）所在 namespace** 的全部资源（对标 OCP OADP）。覆盖 snapshot 之外的东西：`EtcdCluster` CR、StatefulSet/Service/PDB/ConfigMap、TLS Secret（`<name>-{client,server,peer}-tls` 与 CA）、Kamaji `DataStore` / TenantControlPlane 等。
-
-```sh
-# 备份单个 hosted 控制面 namespace
-velero backup create hcp-branch-a-$(date +%Y%m%d%H%M) \
-  --include-namespaces hcp-system \
-  --snapshot-volumes=false        # etcd PV 数据由 §13.1 的 snapshot 单独负责
-```
-
-要点：
-
-- **证书必须一起备**：etcd 的 peer/server/client 证书（cert-manager Secret）是 restore 后成员互信、apiserver 重连的前提。
-- `--snapshot-volumes=false`：etcd PV 是 TopoLVM 本地盘，卷快照不可靠也无必要——数据走 etcd snapshot，Velero 只管 k8s 资源。
-
-### 13.3 恢复流程
-
-「先资源、后数据」两步（对标 OCP HCP 顺序）：
-
-1. **恢复资源**（Velero）：`velero restore create --from-backup <backup>`，拉回 namespace 里的 `EtcdCluster` / Secret / ConfigMap / Kamaji 对象。
-2. **恢复 etcd 数据**（snapshot）：用 §13.1 快照还原成单成员初始数据目录、起单成员，再由 operator 以 learner 扩回 `size`（§11.1）。这就是 §2「quorum 丢失恢复」的手册版。
-3. **核对**：`member list` / `endpoint health` 全绿、`status` 回 `Ready`、hosted apiserver 经 DataStore 重连。
-
-> 自动化（定期调度 + 半自动 restore）见 §15；本期先把手册跑通，保证随时有可用的备份恢复路径。
+本期范围：确定上述方案并验证可行；定期调度、自动 restore 等自动化能力列入 §15，具体手册单独整理。
 
 ## 14. 完整示例
 
@@ -660,7 +611,7 @@ spec:
 
 ## 15. 后期增强
 
-- **备份 / 恢复自动化**：把 §13 手册沉淀为自动能力——`EtcdCluster.spec` 扩展定期快照（`schedule` / `retention` / `objectStorageRef`）、snapshot CronJob、自动上传与 retention 清理、stale/failed 告警；恢复侧对标 OCP `restoreSnapshotURL` 做半自动 restore。
+- **备份 / 恢复自动化**：把 §13 方案落地为自动能力——`EtcdCluster.spec` 扩展定期快照（`schedule` / `retention` / `objectStorageRef`）、snapshot CronJob、自动上传与 retention 清理、stale/failed 告警；恢复侧对标 OCP `restoreSnapshotURL` 做半自动 restore。
 - **TLS 证书轮换**：当前 `tls` 只是证书供给。轮换：证书 Secret/Certificate 变化 → 确认 quorum healthy → 按 member 串行 reload/rolling restart → 每个恢复后查 endpoint health/member list → 全部完成更新 rotation condition。
 - **自动 defrag**：对齐 OCP `etcd-defrag-controller`，按周期 / db 大小阈值串行 defrag，确保 quorum 健康、一次只动一个，仅 HA（size≥3）。
 - **永久换机 / local PV 迁移**：节点被永久替换、local PV 丢失（非 §8.2 复用盘）时，在新节点以全新数据重建 member（remove + learner add）并重新供给 PV。比单成员临时恢复更重，单独设计。
