@@ -59,7 +59,7 @@ HyperShift 把每个 hosted 控制面的 etcd 以 StatefulSet（默认 3 成员�
 | Shared Nothing | 节点级 | `hypershift.openshift.io/cluster` taint + label 把不同 hosted cluster 隔离到独占节点 |
 | Dedicated Request Serving | 节点 + zone 级 | 单个 hosted cluster 在 2 zone 各预留 1 节点，专门承载 kube-apiserver 等前端组件 |
 
-ACP 对应做法见 §8：用专用节点池 + label 把 etcd 隔离到 HCP 管控节点，相当于 Shared Nothing 这一挡。
+ACP 先支持 **Shared Everything**：所有 hosted cluster 的 etcd 共享一个 HCP 管控节点池（专用节点池 + label，§8）——与普通 workload 隔离、但 hosted cluster 之间不隔离；Shared Nothing / Dedicated 后续。
 
 **2. HCP managed 节点升级。** 升级 HCP managed 节点和升级普通节点走的是同一套 CVO + MCO（CVO 编排、MCO 逐个 drain / 替换节点 / 重启），对 HCP managed 节点没有任何特殊处理；节点 drain 受 PDB 约束也不是 etcd 独有的。
 
@@ -81,7 +81,16 @@ ACP 对应做法见 §8：用专用节点池 + label 把 etcd 隔离到 HCP 管�
 
 ## 5. 差距盘点
 
-`EtcdCluster` 底层 etcd 原语已具备，HA 层大多缺失：
+按 §4 四个方面对照本仓库现状：
+
+| 方面 | 现状 | 差距 |
+| --- | --- | --- |
+| 部署拓扑 | 节点池由管控面提供（§8），etcd 经 nodeSelector 落到管控节点 | 先支持 **Shared Everything**（hosted cluster 共享管控节点池）；Shared Nothing / Dedicated 后续 |
+| HCP managed 节点升级 | 完全依赖 CAPI，与普通节点升级无差异 | 无（复用 CAPI drain + PDB；配套的 PDB / readyz / `nodeDrainTimeout=0` 归入 HA 机制、§8.3） |
+| etcd 版本升级 | 改 `spec.version` 即下发新镜像、StatefulSet RollingUpdate | **新增**：readyz 串行门控 + 降级硬校验（§9.5） |
+| etcd HA 机制 | 底层 etcd 原语已具备、HA 层大多缺失（详见下表） | 靠 `EtcdCluster` 补字段（详见下表） |
+
+其中「etcd HA 机制」逐项对照（沿用 §4 第 4 项划分，原有表格基本复用）：
 
 | OCP 机制 | 现状 | 差距 |
 | --- | --- | --- |
