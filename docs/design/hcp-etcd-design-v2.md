@@ -51,7 +51,7 @@ ACP Hosted Control Plane（**ACP HCP**）是 Alauda 基于 Kamaji 和 Cluster AP
 
 **怎么升级。** HyperShift 里每个 hosted 控制面组件（含 etcd）都是 management 集群的 workload。升级分两层：组件自身版本滚动（换镜像、滚动重启 Pod）；承载它们的 management 节点走标准节点滚动升级——CVO 编排、MCO 逐个 drain / 替换节点 / 重启。
 
-**升级机制与普通节点相同、无特殊处理。** OCP 升级 HCP managed 节点和升级普通节点走的是同一套 CVO + MCO，对 HCP managed 节点没有任何特殊处理；节点 drain 受 PDB 约束也不是 etcd 独有的——任何带 PDB 的服务都会这样约束 drain。所以 etcd 在节点升级时不丢 quorum，靠的不是升级流程的特殊改造，而是 **etcd 自己把 PDB + 就绪探针配置对**，让标准 drain 对它也安全（drain 一个 etcd 节点＝中断一个成员，PDB 保证一次只动一个、等成员带原数据重新加入且集群健康后才动下一个）。这正是下面这些 HA 机制要做的事。
+**升级机制与普通节点相同、无特殊处理。** OCP 升级 HCP managed 节点和升级普通节点走的是同一套 CVO + MCO，对 HCP managed 节点没有任何特殊处理；节点 drain 受 PDB 约束也不是 etcd 独有的。
 
 **OCP 的 etcd HA 机制**（3 成员 StatefulSet，下面几层保证滚动升级不丢 quorum）：
 
