@@ -29,7 +29,6 @@ ACP Hosted Control Plane（**ACP HCP**）是 Alauda 基于 Kamaji 和 Cluster AP
 - 备份恢复的**具体操作手册**（命令 / 参数 / 对象存储配置）——单独整理。
 - TLS 证书自动轮换。
 - 自动 defrag。
-- 永久换机 / local PV 迁移（节点被永久替换、本地盘数据丢失后的重建）。
 
 ## 3. 总结
 
@@ -43,6 +42,7 @@ ACP Hosted Control Plane（**ACP HCP**）是 Alauda 基于 Kamaji 和 Cluster AP
 
 - **PDB**（`maxUnavailable: 1`）：任一时刻最多中断 1 个成员。
 - **readyz 探针**：成员「已启动且是有效投票成员（非 learner）」才算就绪。
+- **`nodeDrainTimeout` 不设 / 设为 `0`**：MachineDeployment 的 `spec.deletion.nodeDrainTimeout` 不设置或设为 `0`，即删 Machine 前不限时、无限等待 drain——这样 PDB 才能在 quorum 有风险时一直拦住驱逐；设了非 0 超时会让 CAPI 到点强删、绕过 PDB（§7.3）。
 - 合起来＝**一次只动一个，动下一个前先确认上一个是健康投票成员**。（§8.3、§8.5）
 
 **4. 升级超时（>2h 未完成）需人工介入。** 取舍是宁可让升级一直等，也绝不冒丢 quorum 的风险。如某成员没就绪、PDB 不满足时，drain 的驱逐被一直拒绝、`Machine` 卡 `Deleting`、`MachineDeployment` 长期不 ready；而 **MD 没有超时自动报错（置 Failed）的机制**，需运维盯着，按「Machine → PDB → 哪个成员没就绪」排查。（§11.3）
@@ -51,7 +51,7 @@ ACP Hosted Control Plane（**ACP HCP**）是 Alauda 基于 Kamaji 和 Cluster AP
 
 HyperShift 把每个 hosted 控制面的 etcd 以 StatefulSet（默认 3 成员）跑在 management 集群。从四个方面看 OCP 怎么让它达到生产可用：
 
-**1. 部署（节点拓扑与隔离）。** management 节点拓扑分三挡，隔离强度递增：
+**1. 部署（节点拓扑与隔离）。** management 节点拓扑分三挡：
 
 | 档位 | 隔离强度 | 关键机制 |
 | --- | --- | --- |
@@ -87,7 +87,7 @@ ACP 先支持 **Shared Everything**：所有 hosted cluster 的 etcd 共享一�
 | --- | --- | --- |
 | 部署拓扑 | 节点池由管控面提供（§7），etcd 经 nodeSelector 落到管控节点 | 先支持 **Shared Everything**（hosted cluster 共享管控节点池）；Shared Nothing / Dedicated 后续 |
 | HCP managed 节点升级 | 完全依赖 CAPI，与普通节点升级无差异 | 无（复用 CAPI drain + PDB；配套的 PDB / readyz / `nodeDrainTimeout=0` 归入 HA 机制、§7.3） |
-| etcd 版本升级 | 改 `spec.version` 即下发新镜像、StatefulSet RollingUpdate | **新增**：readyz 串行把关 + 降级硬校验（§8.6） |
+| etcd 版本升级 | 改 `spec.version` 即下发新镜像、StatefulSet RollingUpdate | **新增**：readyz 串行把关 + etcd 版本 skew 校验（拦降级、限制跨 minor，§8.6） |
 | etcd HA 机制 | 底层 etcd 原语已具备、HA 层大多缺失（详见下表） | 靠 `EtcdCluster` 补字段（详见下表） |
 
 其中「etcd HA 机制」逐项对照（沿用 §4 第 4 项划分，原有表格基本复用）：
@@ -156,7 +156,11 @@ HCP 管控节点与本地存储由管控面（CAPI + 存储插件）提供，是
 
 ### 7.1 管控节点池
 
-单独建 **CAPI MachineDeployment**，节点打 **`cpaas.io/hcp-management-node: "true"`**（标识 + 供 nodeSelector 选中，§8.4）。在 **MachineConfigPool** 提前规划每节点的 **IP、hostname、etcd 本地存储用的持久盘**（如 `/dev/vdc`）——这三者是换机后成员带原数据 rejoin 的基础（§7.2）。
+为 HCP 管控节点单独建 **CAPI MachineDeployment**，要点：
+
+- **专有 label**：节点打 **`cpaas.io/hcp-management-node: "true"`**——既是标识，也供 `EtcdCluster` 的 nodeSelector 选中（§8.4）。
+- **规划三要素**：在 **MachineConfigPool** 提前规划每节点的 **IP、hostname、etcd 本地存储用的持久盘**（如 `/dev/vdc`）——这三者是换机后成员带原数据 rejoin 的基础（§7.2）。
+- **zone label（开启 zone spread 时必需）**：若用 zone 级 topology spread / anti-affinity 分散成员（§8.4），需确保每个管控节点带标准 zone 标签 **`topology.kubernetes.io/zone`**；否则 zone 维度的约束无法生效、Pod 可能 Pending。
 
 ### 7.2 TopoLVM 本地存储 + 换机复用盘
 
@@ -197,7 +201,7 @@ HCP 管控节点与本地存储由管控面（CAPI + 存储插件）提供，是
   ```
   一节点一专用盘 → 一节点一成员 → 落实 §8.1 硬性规则（同集群两成员不落同盘）。
 
-**复用盘的基础设施保证**：ACP **Baremetal Provider 保证换机后新节点复用旧节点的 IP、hostname、持久盘**，故升级时 TopoLVM 无需变更、按节点 IP 识别，`/dev/vdc` 的 VG/LV 原样重挂；配合 `WaitForFirstConsumer` 的 PV（hostname nodeAffinity 仍匹配），成员换机后带原数据 rejoin。若用换机即清空的临时盘，则每次升级丢数据、退化为重建（§13）。
+**复用盘的基础设施保证**：ACP **Baremetal Provider 保证换机后新节点复用旧节点的 IP、hostname、持久盘**，故升级时 TopoLVM 无需变更、按节点 IP 识别，`/dev/vdc` 的 VG/LV 原样重挂；配合 `WaitForFirstConsumer` 的 PV（hostname nodeAffinity 仍匹配），成员换机后带原数据 rejoin。若用换机即清空的临时盘，则每次升级丢数据、退化为重建。
 
 ### 7.3 CAPI 节点 drain 必须守 PDB（`nodeDrainTimeout`）
 
@@ -627,11 +631,7 @@ flowchart TD
 - **etcd 数据**（key-value）：用 **etcd snapshot** 备份（对标 OCP `etcdctl snapshot save`）。snapshot 只覆盖数据本身，不含证书 / CR 等资源。
 - **hosted 控制面的 k8s 资源**（`EtcdCluster` CR、TLS Secret、ConfigMap、Kamaji `DataStore` / TenantControlPlane 等）：用 **Velero** 备份它们所在的 namespace（对标 OCP 用 OADP，即 Velero，备份 hosted control plane）。
 
-**几个关键取舍**：
-
-- **证书必须纳入资源备份**：etcd 的 peer/server/client 证书（cert-manager 签发的 Secret）是 restore 后成员互信、apiserver 重连的前提，必须跟着 namespace 一起备。
-- **不用卷快照**：etcd 的 PV 是 TopoLVM 本地盘，跨节点卷快照不可靠也无必要——数据恢复一律走 etcd snapshot，Velero 只负责 k8s 资源。
-- **恢复顺序「先资源、后数据」**：先用 Velero 把 namespace 资源（含 `EtcdCluster` / 证书）拉回来，再用 snapshot 把 etcd 数据灌回去、由 operator 以 learner 逐个扩回 `size`（§10.1）——这也是 §2「quorum 丢失恢复」的落地路径。
+恢复顺序「先资源、后数据」：先用 Velero 把 namespace 资源拉回来，再用 snapshot 把 etcd 数据灌回去、由 operator 以 learner 逐个扩回 `size`（§10.1）——也是 §2「quorum 丢失恢复」的落地路径。
 
 本期范围：确定上述方案并验证可行；定期调度、自动 restore 等自动化能力列入 §13，具体手册单独整理。
 
@@ -640,7 +640,6 @@ flowchart TD
 - **备份 / 恢复自动化**：把 §12 方案落地为自动能力——`EtcdCluster.spec` 扩展定期快照（`schedule` / `retention` / `objectStorageRef`）、snapshot CronJob、自动上传与 retention 清理、stale/failed 告警；恢复侧对标 OCP `restoreSnapshotURL` 做半自动 restore。
 - **TLS 证书轮换**：当前 `tls` 只是证书供给。轮换：证书 Secret/Certificate 变化 → 确认 quorum healthy → 按 member 串行 reload/rolling restart → 每个恢复后查 endpoint health/member list → 全部完成更新 rotation condition。
 - **自动 defrag**：对齐 OCP `etcd-defrag-controller`，按周期 / db 大小阈值串行 defrag，确保 quorum 健康、一次只动一个，仅 HA（size≥3）。
-- **永久换机 / local PV 迁移**：节点被永久替换、local PV 丢失（非 §7.2 复用盘）时，在新节点以全新数据重建 member（remove + learner add）并重新供给 PV。比单成员临时恢复更重，单独设计。
 
 ## 14. 参考
 
