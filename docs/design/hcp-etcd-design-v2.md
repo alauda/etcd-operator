@@ -11,20 +11,7 @@ ACP Hosted Control Plane（简称 **ACP HCP**）是 Alauda 的托管控制面方
 - 如何安全地做 **etcd 版本升级**；
 - 如何支持 **etcd 的备份与恢复**。
 
-本设计先调研 OCP HCP（HyperShift）是怎么做的（§4），再整理出一套适合 ACP HCP 的方案。**本期落地前三项的高可用能力，并对标 OCP 提供备份与恢复手册（§13：etcd snapshot + Velero）；备份/恢复的自动化（定期调度、自动 restore）列入后续迭代（§15）**——与 §2 的 Goal / Non-Goal 对应。
-
-**为什么 etcd 是关键。** 每个 hosted 控制面都需要一套独立的 etcd：一是数据隔离（各租户的集群数据互不可见），二是故障隔离（一套 etcd 出问题不波及其他租户）。每套 etcd 以一个 StatefulSet（默认 3 成员）运行在 management 节点上，hosted 集群的 apiserver 通过 **Kamaji** 的 `DataStore` 连接器接到它（详见 §10）。
-
-**核心矛盾。** management 节点会经常升级和维护——节点滚动升级、drain（驱逐节点上的 Pod）、换机、重启都是常态；而 etcd 是对 quorum（多数派）敏感的有状态服务。3 成员的 etcd 最多只能同时挂 1 个，挂 2 个就丢 quorum，对应的 hosted 控制面 API 立刻不可用。**所以所有节点动作都必须保证 etcd 不丢 quorum。** 这正是本设计要解决的问题。
-
-**对标与基线**：
-
-- 对标对象选 **OpenShift HCP（HyperShift）**——它是目前最成熟的 hosted etcd 高可用实现，§4 起逐项拆解它的做法。
-- 实现基线是本仓库 `etcd-io/etcd-operator`，etcd 版本 `v3.6.5`，CRD `operator.etcd.io/v1alpha1`（命名空间级，目前只有 `EtcdCluster` 一个 CRD）。
-
-**为什么要做这份设计**：现有 `EtcdCluster` 只具备 etcd 集群的底层增删原语（成员 Add/Remove/Promote，仅用于扩缩容），缺少节点升级场景下的高可用能力——状态可观测、就绪探针、调度分散、PDB、单成员自愈都没有。本设计就是把这些 HA 能力补齐。
-
-**阅读主线**：背景（§1）→ Goal/Non-Goal（§2）→ 核心总结（§3）→ 对标 OCP 升级（§4）→ 盘点差距（§5）→ CRD（§6）→ 总体部署/升级流程（§7）→ 高可用改造：管控面（§8）/ etcd-operator（§9）/ DataStore（§10）→ 工作流程（§11）→ 可观测与运维（§12）→ 备份与恢复（§13）→ 完整示例（§14）→ 后期增强（§15）。
+本设计先调研 OCP HCP（HyperShift）是怎么做的（§4），再整理出一套适合 ACP HCP 的方案：本期落地前三项的高可用能力，并对标 OCP 提供备份与恢复手册（etcd snapshot + Velero），备份/恢复的自动化列入后续迭代。具体范围见 §2 的 Goal / Non-Goal。
 
 ## 2. Goal / Non-Goal
 
@@ -43,9 +30,7 @@ ACP Hosted Control Plane（简称 **ACP HCP**）是 Alauda 的托管控制面方
 - 自动 defrag。
 - 永久换机 / local PV 迁移（节点被永久替换、本地盘数据丢失后的重建）。
 
-**不新增高层 CRD**：状态、调度、PDB、自愈都是通用的 etcd HA 能力，属于 `EtcdCluster` 本身、可回馈上游；ACP 专属的只有「发布一个 Kamaji DataStore」这一件事，不值得为它单独再立一个 CRD。
-
-## 3. 核心总结
+## 3. 总结
 
 整套方案落在四件事上，对应四条保证：
 
@@ -59,7 +44,7 @@ ACP Hosted Control Plane（简称 **ACP HCP**）是 Alauda 的托管控制面方
 - **readyz 就绪探针**：一个成员只有真正「已启动、且是有效投票成员（leader/follower，不是 learner）」时才算就绪。
 - 合起来就是：**一次只动一个成员，而且在动下一个之前，先确认上一个已经是健康的投票成员。** 这就是升级全程不丢 quorum 的关键。（详见 §9.2、§9.4）
 
-**4. 升级超时（经验值 >2h 仍未完成）需要人工介入。** 这套机制是用「安全地卡住等待」换「绝不丢 quorum」。举例：当某个 etcd 成员没就绪、PDB 不满足时，节点 drain 发起的驱逐请求会被一直拒绝、对应的 `Machine` 卡在 `Deleting`、`MachineDeployment` 长期回不到 ready。**要特别注意：MachineDeployment 没有「超时就自动报错（置 Failed）」的机制**，它不会自己把问题暴露出来。所以需要运维盯着：一旦升级长时间（经验值约 2 小时）还没完成，就要人工按「Machine → PDB → 哪个成员没就绪」的顺序排查。（详见 §12.3）
+**4. 升级超时（经验值 >2h 仍未完成）需要人工介入。** 这套机制的取舍是：宁可让升级停下来一直等，也绝不冒丢 quorum 的风险。举例：当某个 etcd 成员没就绪、PDB 不满足时，节点 drain 发起的驱逐请求会被一直拒绝、对应的 `Machine` 卡在 `Deleting`、`MachineDeployment` 长期回不到 ready。**要特别注意：MachineDeployment 没有「超时就自动报错（置 Failed）」的机制**，它不会自己把问题暴露出来。所以需要运维盯着：一旦升级长时间（经验值约 2 小时）还没完成，就要人工按「Machine → PDB → 哪个成员没就绪」的顺序排查。（详见 §12.3）
 
 ## 4. 对标：OCP 如何升级 HCP 管控面
 
