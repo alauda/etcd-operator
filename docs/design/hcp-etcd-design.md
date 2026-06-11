@@ -11,30 +11,27 @@ ACP Hosted Control Plane（**ACP HCP**）是 Alauda 基于 Kamaji 和 Cluster AP
 - **etcd 版本安全升级**；
 - **etcd 备份与恢复**。
 
-本设计对标 OCP HCP（HyperShift，§4）：本期落地前三项的高可用能力，并给出备份恢复方案（etcd snapshot + Velero），自动化与具体手册列入后续。范围见 §2。
+本设计对标 OCP HCP（HyperShift，§4）：本期落地前三项的高可用能力，并给出容灾方案（分级恢复 + etcd snapshot + Velero，§12），自动化与具体手册列入后续。范围见 §2。
 
 ## 2. Goal / Non-Goal
 
-**Goal（本期）**
+**Goal**
 
-- `EtcdCluster` 从「能扩缩容」提升到「节点升级时高可用」。
+- 保证 HCP managed 节点升级时 etcd 的可用性。
 - 支持 etcd 版本升级。
-- 接入 Kamaji（发布 DataStore 供 hosted apiserver 连接）。
-- 明确备份恢复方案：etcd snapshot 备数据 + Velero 备控制面 namespace 资源（§12）。
+- etcd 单成员故障自动恢复。
+- 明确容灾方案（§12）。
 
-**Non-Goal（本期不做，自动化见 §13）**
+**Non-Goal**
 
-- 备份 / 恢复**自动化**：定期快照调度、自动 restore（本期只定方案，§12）。
-- quorum 丢失后的**自动**恢复（恢复方案见 §12）。
-- 备份恢复的**具体操作手册**（命令 / 参数 / 对象存储配置）——单独整理。
+- 备份 / 恢复**自动化**：定期快照调度、自动 restore（只定方案，§12）。
+- 备份恢复、quorum 丢失恢复的**具体操作手册**（命令 / 参数 / 对象存储配置）：手动 runbook，单独整理（方案见 §12）。
 - TLS 证书自动轮换。
 - 自动 defrag。
 
 ## 3. 总结
 
-四件事，对应四条保证：
-
-**1. HCP 专用节点 + 专有 label。** 单独建 CAPI MachineDeployment，节点打 `cpaas.io/hcp-management-node: "true"`；`EtcdCluster` 用 nodeSelector 把 etcd 调度到这批节点，与其他 workload 分开。（§7.1、§8.4）
+**1. HCP 专用节点（worker、非 master）+ 专有 label。** 单独建 CAPI MachineDeployment，节点打 `cpaas.io/hcp-management-node: "true"`；`EtcdCluster` 用 nodeSelector 把 etcd 调度到这批节点，与其他 workload 分开。**管控节点须为 worker——落到 master 会让 master 上的 OVN 永远无法驱逐、堵死 drain。**（§7.1、§8.4）
 
 **2. TopoLVM 本地存储 + 换机复用盘。** TopoLVM 给每个节点从专用磁盘切本地卷；ACP Baremetal Provider 保证换机时新节点复用旧节点的 **IP、hostname、持久盘**，TopoLVM 按节点 IP 识别、原样重挂 VG/LV——**数据可复用，etcd 带原数据 rejoin、而非清空重建。**（§7.2）
 
@@ -110,7 +107,7 @@ ACP 先支持 **Shared Everything**：所有 hosted cluster 的 etcd 共享一�
 
 ---
 
-> 以上为背景与对标分析。**以下进入正式方案设计**：总体部署与升级流程（§6）→ 生产可用改造：管控面（§7）/ etcd-operator（§8，含 CRD）/ DataStore（§9）→ 工作流程（§10）→ 可观测与运维（§11）→ 备份与恢复（§12）。
+> 以上为背景与对标分析。**以下进入正式方案设计**：总体部署与升级流程（§6）→ 生产可用改造：管控面（§7）/ etcd-operator（§8，含 CRD）/ DataStore（§9）→ 工作流程（§10）→ 可观测与运维（§11）→ 容灾（§12）。
 
 ## 6. 总体部署与升级流程
 
@@ -158,6 +155,7 @@ HCP 管控节点与本地存储由管控面（CAPI + 存储插件）提供，是
 
 为 HCP 管控节点单独建 **CAPI MachineDeployment**，要点：
 
+- **必须是 worker，不能落 master/control-plane**：HCP 管控面（含 etcd）只跑管控集群的 **worker** 节点。若调度到 master，master 上的 **OVN（ovn-kubernetes）组件永远无法被驱逐** → 节点 drain 永远完不成、堵死换机与升级。故管控节点池建成 worker 节点池，并保证 etcd 的 nodeSelector（§8.4）只命中 worker。
 - **专有 label**：节点打 **`cpaas.io/hcp-management-node: "true"`**——既是标识，也供 `EtcdCluster` 的 nodeSelector 选中（§8.4）。
 - **规划三要素**：在 **MachineConfigPool** 提前规划每节点的 **IP、hostname、etcd 本地存储用的持久盘**（如 `/dev/vdc`）——这三者是换机后成员带原数据 rejoin 的基础（§7.2）。
 - **zone label（开启 zone spread 时必需）**：若用 zone 级 topology spread / anti-affinity 分散成员（§8.4），需确保每个管控节点带标准 zone 标签 **`topology.kubernetes.io/zone`**；否则 zone 维度的约束无法生效、Pod 可能 Pending。
@@ -230,12 +228,14 @@ etcd-operator 是整套方案的核心：它管理 `EtcdCluster` CRD，并据此
 | `storageSpec` | StorageClass + 容量（`volumeSizeRequest` 必填）；SC 约定见下 | 现有 |
 | `tls` | 证书供给（`cert-manager` / `auto`） | 现有 |
 | `etcdOptions` | 透传 etcd 启动参数 | 现有 |
-| `podTemplate` | 调度：nodeSelector / tolerations / affinity / topologySpreadConstraints | **扩展**（当前仅 metadata） |
+| `podTemplate` | 调度：nodeSelector / tolerations / affinity / topologySpreadConstraints / priorityClassName | **扩展**（当前仅 metadata） |
 | `recovery` | 单 member 自动恢复开关与时限 | **新增** |
 
 **StorageClass 约定**：动态供给 PV、`reclaimPolicy:Delete`（自愈删异常 PVC 后回收旧盘、重供空盘）；local/LVM 用 `volumeBindingMode:WaitForFirstConsumer`（PV 随 pod 调度、nodeAffinity 绑 hostname）。勿用「静态绑定 + `Retain`」承载自愈链路。
 
 > **存储形态（对标 OCP）**：`volumeClaimTemplates` 给每个 member 独占一个 PV（RWO）。OCP 给每个控制面节点配 etcd 专用快盘（NVMe/SSD）、用 LVM local SC（thin pool）切成每 pod 一个 LV；故同节点上不同集群各有独立 PV、共用底层物理盘——① noisy-neighbor（同盘争 IOPS，`fdatasync`<10ms，靠盘快 + 容量规划）；② 物理盘是共享故障域，但每集群 3 成员经 anti-affinity 散到 3 节点 3 盘，单盘故障每集群只丢 1 个。**硬性规则：同集群两成员不落同一物理盘。**
+
+> **部署粒度 + STS 渲染**：**一个 HCP 集群一套独立 etcd**（一个 `EtcdCluster`，独立 StatefulSet / PVC / 证书，互不共享）。StatefulSet 用 **`podManagementPolicy: Parallel`**——learner 按 §8.3 故意 NotReady，若用默认 `OrderedReady`，STS 会卡在 NotReady 的 learner、不再创建/管理后续序号的 pod；membership 的串行由 operator（逐个 learner，§10.1）与 readyz（滚动升级，§8.6）保证，不靠 STS pod 顺序。
 
 `status` 由 controller 维护（§8.2）。
 
@@ -264,10 +264,9 @@ spec:
   podTemplate:                                  # §8.4 扩展的调度字段
     spec:
       nodeSelector: { cpaas.io/hcp-management-node: "true" }   # 选中 HCP 管控节点（§7.1）
-      topologySpreadConstraints:
-        - { maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: DoNotSchedule, labelSelector: { matchLabels: { app: branch-a-etcd } } }
+      priorityClassName: system-cluster-critical               # 高优先级，避免资源紧张时被抢占/驱逐（§8.4）
       affinity:
-        podAntiAffinity:
+        podAntiAffinity:                                       # 一节点一成员（§8.1 硬性规则：两成员不落同盘）
           requiredDuringSchedulingIgnoredDuringExecution:
             - { topologyKey: kubernetes.io/hostname, labelSelector: { matchLabels: { app: branch-a-etcd } } }
   recovery: { enabled: true, gracePeriod: 10m, timeout: 30m, maxRetries: 3 }
@@ -290,14 +289,13 @@ status:
   leaderID: "abc"
   members:
     - { name: branch-a-etcd-0, id: "abc", healthy: true, leader: true, learner: false, nodeName: node-a }
-  recovery: { active: false, lastResult: Succeeded, lastRecoveredMember: branch-a-etcd-2 }
+  recovery: { lastResult: Succeeded, lastRecoveredMember: branch-a-etcd-2 }   # 是否进行中看 SingleMemberRecoveryActive condition
   conditions:
     - { type: EtcdClusterCreated,         status: "True" }
     - { type: EtcdClusterReady,           status: "True" }
     - { type: DataStoreReady,             status: "True" }
     - { type: QuorumAvailable,            status: "True" }
-    - { type: SingleMemberDegraded,       status: "False" }
-    - { type: SingleMemberRecoveryActive, status: "False" }
+    - { type: SingleMemberRecoveryActive, status: "False" }   # 单成员自愈进行中；上次结果/成员看 status.recovery
 ```
 
 ### 8.3 etcd 就绪探针
@@ -313,7 +311,9 @@ status:
 
 ### 8.4 扩展 `podTemplate` 调度字段
 
-增加 `nodeSelector` / `tolerations` / `affinity` / `topologySpreadConstraints`，平台侧填。ACP 推荐 **`nodeSelector: cpaas.io/hcp-management-node: "true"`**（§7.1）+ hostname topology spread + 节点级 anti-affinity（避免「2 zone / 3 member」时第 3 个 Pending）。
+增加 `nodeSelector` / `tolerations` / `affinity` / `topologySpreadConstraints` / `priorityClassName`，平台侧填。ACP 推荐 **`nodeSelector: cpaas.io/hcp-management-node: "true"`**（§7.1）+ **节点级 anti-affinity**（hostname，硬性「一节点一成员」，落实 §8.1「两成员不落同盘」）。要跨故障域分散时再加 **zone topologySpread**（`topology.kubernetes.io/zone`，用 `whenUnsatisfiable: ScheduleAnyway` 避免「2 zone / 3 member」时第 3 个 Pending）。hostname 维度上 anti-affinity 已够，不必再叠 hostname spread。
+
+**etcd pod 必须设高优先级 `priorityClassName`**（如 `system-cluster-critical` 或专建的高优先级 PriorityClass）：避免管控节点资源紧张时 etcd 被 **抢占 / node-pressure 驱逐**回收——etcd 一旦被踢就丢成员、危及 quorum。operator 默认给 etcd pod 设高优先级，平台可经 podTemplate 覆盖。
 
 ### 8.5 PDB
 
@@ -374,15 +374,15 @@ spec:
     clientCertificate: { ... }
 ```
 
-endpoint 与证书 Secret 命名稳定可预测，故「谁来生成」可替换，三种放法：
+endpoint 与证书 Secret 命名稳定可预测。本设计采用 **方案 C：etcd-operator 内独立 reconciler 创建/更新 DataStore，Kamaji 引用该 DataStore**：
 
 | 方案 | 形态 | 取舍 |
 | --- | --- | --- |
 | **A. 手动 / 声明式** | `kubectl apply` 或部署模板写死 | 零代码、最简方案；适合集群少、不频繁变动 |
-| **B. Kamaji provider 里 watch** ✅ 倾向 | 放进 `cluster-api-control-plane-provider-kamaji`，watch `EtcdCluster`、`status.phase=Ready` 后 upsert | 职责归位：etcd-operator 不碰 Kamaji 类型、保持可上游；`usedBy` / 删除保护 / schema 绑定更直接 |
-| **C. operator 内独立 reconciler** | 与核心 reconciler 解耦，build tag / 开关控制 | 同进程读 status 最直接，但给 fork 引入 Kamaji 依赖 |
+| **B. Kamaji provider 里 watch** | 放进 `cluster-api-control-plane-provider-kamaji`，watch `EtcdCluster`、`status.phase=Ready` 后 upsert | 职责归位：etcd-operator 不碰 Kamaji 类型、保持可上游；`usedBy` / 删除保护 / schema 绑定更直接 |
+| **C. operator 内独立 reconciler** ✅ 采用 | 与核心 reconciler 解耦，build tag / 开关控制 | 同进程读 status 最直接，由 etcd-operator 负责 DataStore 生命周期；fork 引入 Kamaji 依赖 |
 
-**触发**（B/C）：watch EtcdCluster + annotation（`hcp.alauda.io/datastore: <name>`），或 provider 从 `KamajiControlPlane` 反查。三者对 `EtcdCluster` 透明、可切换，都不给 `spec` 加 Kamaji 字段。`dataStoreSchema`（db 名 / key prefix）属 Kamaji 控制面，唯一性绑定时校验。
+**触发**（C）：operator watch EtcdCluster + annotation（`hcp.alauda.io/datastore: <name>`）。`EtcdCluster.spec` 不加 Kamaji 字段；`dataStoreSchema`（db 名 / key prefix）属 Kamaji 控制面，Kamaji 引用 DataStore 时校验唯一性绑定。
 
 ## 10. 工作流程
 
@@ -393,19 +393,21 @@ sequenceDiagram
   participant U as 用户/平台
   participant C as EtcdCluster controller
   participant K as StatefulSet/Service/PDB/PVC
-  participant P as DataStore 发布方
+  participant D as Kamaji DataStore
+  participant J as Kamaji
   U->>C: 创建 EtcdCluster
   C->>K: 建 Service/Secret/PDB；StatefulSet 0→1
   C->>K: 以 learner 逐个扩到 size（每个 join 且 healthy 后再加下一个）
   C->>C: 写回 status（members/leader/quorum/conditions）
-  C-->>P: status.phase=Ready
-  P->>P: upsert Kamaji DataStore（方案 A/B/C）
+  C->>D: 创建/更新 DataStore（方案 C，operator 内独立 reconciler）
+  J->>D: 引用 DataStore 作为 external etcd
 ```
 
-1. 平台建 `EtcdCluster`（带 HA 调度字段，按需带 `hcp.alauda.io/datastore` annotation）。
+1. 平台建 `EtcdCluster`（带 HA 调度字段，并指定 `hcp.alauda.io/datastore` annotation 作为 DataStore 名称）。
 2. controller 建 Service / Secret / PDB；StatefulSet 0→1，再以 learner 逐个扩到 `size`——每个 join 且 healthy 后才加下一个，保证扩容期 quorum 安全。
 3. 把 member / leader / health / quorum 写回 `status`。
-4. `status.phase=Ready` 后，发布方按 A/B/C upsert DataStore。
+4. `status.phase=Ready` 后，etcd-operator 采用方案 C，由独立 reconciler 创建/更新 Kamaji DataStore。
+5. Kamaji 引用该 DataStore 作为 hosted apiserver 的 external etcd 连接入口。
 
 ### 10.2 单 member 自动恢复
 
@@ -414,9 +416,11 @@ sequenceDiagram
 **检测（两段式）**：
 
 - **触发**（controller，纯看 k8s 状态）：某 etcd pod CrashLoopBackOff（`State.Waiting` 且 `RestartCount>0`）即触发，不连 etcd。
-- **确认**（recovery Job，连 etcd）：查 `MemberList`（谁缺失）+ 逐成员 `Get("health")` 与 `AlarmList`（`NOSPACE`/`CORRUPT`）+ failing pod，任一成立判 unhealthy。
+- **确认**（recovery Job，连 etcd）：查 `MemberList`（谁缺失）+ 逐成员 `Get("health")` 与 `AlarmList`（`CORRUPT`）+ failing pod，任一成立判 unhealthy。
 
-> 判健康用 **pod 重启状态 + etcd alarm**，不是 §8.3 探针。OCP 触发即动手；我们加 `gracePeriod` 去抖，避免把 reboot / 短暂 drain 误判。
+> 判健康用 **pod 重启状态 + etcd alarm（`CORRUPT`）**，不是 §8.3 探针。OCP 触发即动手；我们加 `gracePeriod` 去抖，避免把 reboot / 短暂 drain 误判。
+>
+> **`NOSPACE` 本期不纳入自动恢复**：它是 db 触配额（碎片 / 堆积）的集群级只读告警，常多成员同时报，删盘重建解决不了（新成员会再填满）；正确处置是 **compact + defrag + disarm**（必要时扩配额），依赖 §13 的自动 defrag，本期未支持。故本期 `NOSPACE` 只告警（§11.4「加盘 / defrag」），不触发单成员重建；自动重建只处理 `CORRUPT` / member 缺失 / db 加载失败。
 
 **operator 删 PVC 与 reset-member 的分工**（必须 operator 先）：operator 仅在自愈路径（守卫见下）删该成员 PV+PVC+Pod（正常 reboot/换机/升级不删）→ STS 重建空盘 pod → reset-member 因盘空进入 remove+add。即 **operator 删 PVC 正是把 reset-member 从「数据在→no-op」切到「数据空→重置成员」的开关**：operator 清数据（有全局守卫），reset-member 对齐成员表（pod 本地、幂等）。init 容器不能自删 PVC（finalizer 拦 + 无守卫易误删）；remove→add 间成员表短暂 3→2，故守卫坚持仅 1 异常。
 
@@ -503,8 +507,9 @@ spec:
                   echo "[UNHEALTHY] AlarmList failed on ${ep}"
                   echo "${alarm_out}"
                   unhealthy=1
-                elif echo "${alarm_out}" | grep -E '\b(NOSPACE|CORRUPT)\b' >/dev/null; then
-                  echo "[UNHEALTHY] critical alarm found on ${ep}:"
+                elif echo "${alarm_out}" | grep -E '\bCORRUPT\b' >/dev/null; then
+                  # NOSPACE 不在此列：它要 compact+defrag+disarm（依赖 §13 自动 defrag），本期只告警、不重建
+                  echo "[UNHEALTHY] CORRUPT alarm found on ${ep}:"
                   echo "${alarm_out}"
                   unhealthy=1
                 fi
@@ -542,7 +547,7 @@ spec:
             - { name: ETCD_HEADLESS_SERVICE, value: branch-a-etcd }
             - { name: ETCD_REPLICAS,         value: "3" }
             - { name: ETCD_SCHEME,           value: https }
-            - { name: ETCD_POD_SELECTOR,     value: app.kubernetes.io/instance=branch-a-etcd }
+            - { name: ETCD_POD_SELECTOR,     value: app=branch-a-etcd }
             - { name: ETCDCTL_CACERT,        value: /etc/etcd/tls/ca.crt }
             - { name: ETCDCTL_CERT,          value: /etc/etcd/tls/tls.crt }
             - { name: ETCDCTL_KEY,           value: /etc/etcd/tls/tls.key }
@@ -563,24 +568,24 @@ flowchart TD
   A["controller: etcd pod CrashLoopBackOff<br/>(Waiting 且 RestartCount>0)"] --> C{"超过 gracePeriod<br/>且无并发 scale/upgrade?"}
   C -->|否| W[继续观察]
   C -->|是| D{已有 recovery Job?}
-  D -->|Running| E[等待<br/>RecoveryActive=True]
-  D -->|Failed| F[保留 Job 供排障<br/>RecoveryActive=False<br/>reason=RecoveryJobFailed]
+  D -->|Running| E[等待<br/>SingleMemberRecoveryActive=True]
+  D -->|Failed| F[保留 Job 供排障<br/>SingleMemberRecoveryActive=False<br/>recovery.lastResult=Failed]
   D -->|不存在| G[创建 recovery Job]
-  G --> Q{"Job 连 etcd 确认 + 守卫<br/>member 缺失 / NOSPACE / CORRUPT?<br/>quorum 可用且仅 1 异常?"}
+  G --> Q{"Job 连 etcd 确认 + 守卫<br/>member 缺失 / CORRUPT / 加载失败?<br/>quorum 可用且仅 1 异常?"}
   Q -->|否| F
   Q -->|是| H["operator 删该 member 的 PVC+Pod<br/>STS 重建空盘 pod<br/>reset-member 容器 remove 旧+add 新<br/>全新数据 rejoin"]
   H --> I{"验收 Pod Ready<br/>且 endpoint 3/3?"}
-  I -->|通过| J[清理临时资源<br/>RecoveryActive=False<br/>reason=RecoverySucceeded]
+  I -->|通过| J[清理临时资源<br/>SingleMemberRecoveryActive=False<br/>recovery.lastResult=Succeeded]
   I -->|超时或失败| F
 ```
 
 1. controller 检测某 etcd pod CrashLoopBackOff（`Waiting` 且 `RestartCount>0`）。
 2. 持续超 `gracePeriod` 且无并发 scale/upgrade/recovery；否则继续观察。
 3. 按 recovery Job 状态：Running 等待；Failed 保留供排障、不重试；不存在则创建。
-4. Job 连 etcd 确认并守卫：member 缺失或 `NOSPACE`/`CORRUPT` 判异常；quorum 不可用或 ≥2 成员异常 → Job 失败（需人工）。
+4. Job 连 etcd 确认并守卫：member 缺失、`CORRUPT` 或 db 加载失败判异常（`NOSPACE` 不在此列，见上方说明）；quorum 不可用或 ≥2 成员异常 → Job 失败（需人工）。
 5. 恢复：**operator 删**该成员 PVC（`etcd-data-<pod>`）+ Pod → SC 按 `Delete` 回收旧 PV → STS 重建**空盘** pod；**reset-member** 因盘空 `member remove`(旧) + `member add`(新) → 全新数据 rejoin。
 6. 验收 Pod Ready、endpoint health 3/3。
-7. 通过则清理、置 `RecoverySucceeded`、更新 `status.recovery`；超时/失败置 `RecoveryJobFailed`、不重试。
+7. 通过则清理、`recovery.lastResult=Succeeded`、更新 `status.recovery`；超时/失败 `recovery.lastResult=Failed`、不重试。
 
 ≥2 成员异常或 quorum 丢失：只告警，不自动恢复。
 
@@ -609,9 +614,9 @@ flowchart TD
 | 触发 | 现象 | 处置 |
 | --- | --- | --- |
 | **升级长时间未完成**（经验值：**>2h** MachineDeployment 仍未 fully ready） | MD `updatedReplicas`/`readyReplicas` 长期 < `replicas`。注意 **MD 没有「超时自动把 `status.phase` 置 `Failed`」的机制**（不像 ModuleInfo），它不会自己报错 | 看 **MD `status` + etcd-operator 日志**，顺着 §11.4：Machine `DrainingSucceeded` → PDB → 哪个 member 没就绪 |
-| **quorum 丢失（≥2 member 异常）** | `QuorumAvailable=False`；自愈只告警不动手 | 按 §12 恢复方案走 snapshot 恢复，期间 API 不可用 |
+| **quorum 丢失（≥2 member 异常）** | `QuorumAvailable=False`；自愈只告警不动手 | 按 §12 容灾方案走 snapshot 恢复（先资源后数据），期间 API 不可用 |
 | **节点 drain 长期卡住** | Machine 卡 `Deleting`、PDB `ALLOWED DISRUPTIONS=0` | 查其余 member 为何没 Ready；等 §10.2 自愈 / 人工修复，**切忌 force delete 跳过 PDB / 误设 `nodeDrainTimeout`** |
-| **recovery Job Failed** | `reason=RecoveryJobFailed`、不自动重试 | 看 Job 日志定位，手动修复后删 Job 重试 |
+| **recovery Job Failed** | `recovery.lastResult=Failed`、不自动重试 | 看 Job 日志定位，手动修复后删 Job 重试 |
 | **数据盘没重挂** | reset-member 反复 `removing/Adding`、member 反复全量同步 | 查 Baremetal Provider 是否真复用了旧盘 / hostname（§7.2） |
 | **降级被拒** | apply 报错（改小了 version） | 降级基本不支持；如确需，走 etcd 受限降级流程 |
 
@@ -622,18 +627,23 @@ flowchart TD
 - **节点升级不动**：先看 `kubectl get machines` 是否卡 Deleting、再看 `kubectl get pdb`（ALLOWED=0）、再看哪个 member 没 Ready（readyz）。
 - **alarm**：`NOSPACE` → 加盘 / defrag；`CORRUPT` → 该 member 走自愈重建（§10.2）。
 
-## 12. 备份与恢复（方案，对标 OCP）
+## 12. 容灾（备份与恢复，对标 OCP HCP）
 
-> 本节只讨论**方案与思路**，对标 OCP HCP 的容灾做法；具体操作手册（命令、参数、对象存储配置等）另行单独整理，不在本设计内展开。
+> 本节只定**方案与思路**，对标 OCP HCP（HyperShift）的容灾做法；具体手册另行整理。详细调研见 [docs/ocp-hcp-disaster-recovery-research.md](../ocp-hcp-disaster-recovery-research.md)。
 
-核心思路：**两类东西分开备份，恢复时配合**。
+容灾分两层，先自愈、不行再恢复：
 
-- **etcd 数据**（key-value）：用 **etcd snapshot** 备份（对标 OCP `etcdctl snapshot save`）。snapshot 只覆盖数据本身，不含证书 / CR 等资源。
-- **hosted 控制面的 k8s 资源**（`EtcdCluster` CR、TLS Secret、ConfigMap、Kamaji `DataStore` / TenantControlPlane 等）：用 **Velero** 备份它们所在的 namespace（对标 OCP 用 OADP，即 Velero，备份 hosted control plane）。
+- **单成员故障（quorum 在）**：§10.2 自动自愈，删 PVC+Pod 重建、reset-member 干净重入，**不需快照、不停机**。
+- **quorum 丢失 / 控制面资源丢失**：需从备份恢复，期间 hosted apiserver 不可用。
 
-恢复顺序「先资源、后数据」：先用 Velero 把 namespace 资源拉回来，再用 snapshot 把 etcd 数据灌回去、由 operator 以 learner 逐个扩回 `size`（§10.1）——也是 §2「quorum 丢失恢复」的落地路径。
+恢复用两个工具，按需取用：
 
-本期范围：确定上述方案并验证可行；定期调度、自动 restore 等自动化能力列入 §13，具体手册单独整理。
+- **Velero**：备份 hosted 控制面 namespace 的**资源（`EtcdCluster` CR、TLS Secret、DataStore 等）+ PV 卷**（含 etcd 的 PVC/PV）。一个 `Backup`/`Schedule` 用 `includedNamespaces` 即可**批量覆盖多个 hosted cluster**，对标 OCP 的 OADP。
+- **etcd snapshot**（`etcdctl snapshot save`）：针对**单个集群**的 etcd 做一致性快照，恢复后由 operator 以 learner 逐个扩回 `size`（§10.1）。
+
+恢复顺序「**先资源后数据**」：Velero 拉回 namespace 资源（TLS Secret 必须先在场，否则成员起不来），再灌 etcd 数据——也是 §2「quorum 丢失恢复」的落地路径。备份统一落 **S3 兼容对象存储**。
+
+> 两者分工：Velero 管资源 + 卷级兜底、能批量；要事务一致的时间点镜像（尤其升级前）用 etcd snapshot。本期只定方案，定时调度、自动 restore 列入 §13。
 
 ## 13. 后期增强
 
@@ -646,9 +656,12 @@ flowchart TD
 - 底层实现：`api/v1alpha1/etcdcluster_types.go`、`internal/controller/etcdcluster_controller.go`、`internal/etcdutils/`
 - Kamaji CRD：`chart/charts/kamaji/templates/crds/`
 - CAPI 节点 drain / PDB / `nodeDrainTimeout`：<https://cluster-api.sigs.k8s.io/tasks/automated-machine-management/machine_deletions>
+- OCP HCP 容灾调研（本仓库，§12 据此）：[docs/ocp-hcp-disaster-recovery-research.md](../ocp-hcp-disaster-recovery-research.md)
 - OCP HCP / HyperShift hosted etcd：
   - 单 member 自愈 / DR：<https://hypershift.pages.dev/how-to/disaster-recovery/etcd-recovery/>
   - etcd snapshot backup（Tech Preview）：<https://hypershift.pages.dev/how-to/disaster-recovery/etcd-snapshot-backup/>
+  - 手动 etcd 快照 backup/restore runbook：<https://hypershift.pages.dev/how-to/aws/etc-backup-restore/>
+  - OADP/Velero 备份恢复（含 includedNamespaces/includedResources）：<https://hypershift.pages.dev/how-to/disaster-recovery/backup-and-restore-oadp/>
   - reset-member / 探针 / PDB：`openshift/hypershift` `control-plane-operator/.../v2/{etcd,assets/etcd}`、`support/controlplane-component`
   - `:9980` readyz 实现（serializable Get、**不查 learner**）：`openshift/cluster-etcd-operator` `pkg/cmd/readyz/readyz.go`
   - 存储建议（local / LVM）：<https://docs.okd.io/latest/hosted_control_planes/hcp-deploy/hcp-deploy-virt.html>
