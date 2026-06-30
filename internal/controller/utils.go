@@ -16,11 +16,13 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -34,9 +36,27 @@ import (
 )
 
 const (
-	etcdDataDir = "/var/lib/etcd"
-	volumeName  = "etcd-data"
+	etcdDataDir                  = "/var/lib/etcd"
+	volumeName                   = "etcd-data"
+	defaultEtcdPriorityClassName = "system-cluster-critical"
+	etcdClientServiceNameSuffix  = "-client"
+	etcdProbeContainerName       = "etcd-probe"
+	etcdProbePortName            = "probe"
+	etcdProbePort                = 9980
+	etcdProbeCertMountPath       = "/etc/etcd/certs/client"
+	resetMemberContainerName     = "reset-member"
 )
+
+type StatefulSetOptions struct {
+	ProbeImage string
+}
+
+func firstStatefulSetOptions(options []StatefulSetOptions) StatefulSetOptions {
+	if len(options) == 0 {
+		return StatefulSetOptions{}
+	}
+	return options[0]
+}
 
 type etcdClusterState string
 
@@ -45,7 +65,7 @@ const (
 	etcdClusterStateExisting etcdClusterState = "existing"
 )
 
-func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme) (*appsv1.StatefulSet, error) {
+func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme, options ...StatefulSetOptions) (*appsv1.StatefulSet, error) {
 
 	// prepare/update configmap for StatefulSet
 	err := applyEtcdClusterState(ctx, ec, int(replicas), c, scheme, logger)
@@ -60,7 +80,7 @@ func reconcileStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha
 	}
 
 	// Create Update StatefulSet
-	err = createOrPatchStatefulSet(ctx, logger, ec, c, replicas, scheme)
+	err = createOrPatchStatefulSet(ctx, logger, ec, c, replicas, scheme, options...)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +171,172 @@ func createArgs(name string, etcdOptions []string, tls bool) []string {
 	return defaultArgs
 }
 
-func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme) error {
+func labelsForEtcdCluster(ec *ecv1alpha1.EtcdCluster) map[string]string {
+	return map[string]string{
+		"app":        ec.Name,
+		"controller": ec.Name,
+	}
+}
+
+func clientServiceNameForEtcdCluster(ec *ecv1alpha1.EtcdCluster) string {
+	return ec.Name + etcdClientServiceNameSuffix
+}
+
+func applyPodTemplateSpec(podTemplate *ecv1alpha1.PodTemplate, podSpec *corev1.PodSpec) {
+	if podTemplate == nil || podTemplate.Spec == nil {
+		return
+	}
+
+	templateSpec := podTemplate.Spec
+	if len(templateSpec.NodeSelector) > 0 {
+		podSpec.NodeSelector = templateSpec.NodeSelector
+	}
+	if len(templateSpec.Tolerations) > 0 {
+		podSpec.Tolerations = templateSpec.Tolerations
+	}
+	if templateSpec.Affinity != nil {
+		podSpec.Affinity = templateSpec.Affinity
+	}
+	if len(templateSpec.TopologySpreadConstraints) > 0 {
+		podSpec.TopologySpreadConstraints = templateSpec.TopologySpreadConstraints
+	}
+	if templateSpec.PriorityClassName != "" {
+		podSpec.PriorityClassName = templateSpec.PriorityClassName
+	}
+}
+
+func etcdProbe(path string, periodSeconds, failureThreshold, timeoutSeconds int32) *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: path,
+				Port: intstr.FromInt32(etcdProbePort),
+			},
+		},
+		PeriodSeconds:    periodSeconds,
+		FailureThreshold: failureThreshold,
+		TimeoutSeconds:   timeoutSeconds,
+	}
+}
+
+func probeEndpointForEtcdCluster(ec *ecv1alpha1.EtcdCluster) string {
+	scheme := "http"
+	if ec.Spec.TLS != nil {
+		scheme = "https"
+	}
+	return fmt.Sprintf("%s://$(POD_NAME).$(ETCD_SERVICE_NAME).$(POD_NAMESPACE).svc.cluster.local:2379", scheme)
+}
+
+func probeContainerForEtcdCluster(ec *ecv1alpha1.EtcdCluster, image string) corev1.Container {
+	args := []string{
+		"--listen-address=:9980",
+		fmt.Sprintf("--endpoint=%s", probeEndpointForEtcdCluster(ec)),
+		"--timeout=30s",
+	}
+	volumeMounts := []corev1.VolumeMount{}
+	if ec.Spec.TLS != nil {
+		args = append(args,
+			fmt.Sprintf("--cacert=%s/ca.crt", etcdProbeCertMountPath),
+			fmt.Sprintf("--cert=%s/tls.crt", etcdProbeCertMountPath),
+			fmt.Sprintf("--key=%s/tls.key", etcdProbeCertMountPath),
+		)
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      "client-secret",
+			MountPath: etcdProbeCertMountPath,
+		})
+	}
+
+	return corev1.Container{
+		Name:    etcdProbeContainerName,
+		Image:   image,
+		Command: []string{"/etcd-probe"},
+		Args:    args,
+		Env: []corev1.EnvVar{
+			{
+				Name: "POD_NAME",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"},
+				},
+			},
+			{
+				Name: "POD_NAMESPACE",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+				},
+			},
+			{Name: "ETCD_SERVICE_NAME", Value: ec.Name},
+			{Name: "ETCD_REPLICAS", Value: strconv.Itoa(ec.Spec.Size)},
+		},
+		Ports: []corev1.ContainerPort{{
+			Name:          etcdProbePortName,
+			ContainerPort: etcdProbePort,
+		}},
+		VolumeMounts: volumeMounts,
+	}
+}
+
+func resetMemberInitContainerForEtcdCluster(ec *ecv1alpha1.EtcdCluster) corev1.Container {
+	image := fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version)
+	args := []string{`set -eu
+if [ -f /var/lib/etcd/member/snap/db ]; then
+  echo "member has data; reset-member no-op"
+  exit 0
+fi
+
+scheme="http"
+etcdctl_tls_args=""
+if [ -f /etc/etcd/certs/client/ca.crt ]; then
+  scheme="https"
+  etcdctl_tls_args="--cacert=/etc/etcd/certs/client/ca.crt --cert=/etc/etcd/certs/client/tls.crt --key=/etc/etcd/certs/client/tls.key"
+fi
+endpoints=""
+for i in $(seq 0 $((ETCD_REPLICAS - 1))); do
+  member_name="${ETCD_SERVICE_NAME}-${i}"
+  if [ "${member_name}" = "${POD_NAME}" ]; then
+    continue
+  fi
+  ep="${scheme}://${member_name}.${ETCD_SERVICE_NAME}.${POD_NAMESPACE}.svc.cluster.local:2379"
+  if [ -z "${endpoints}" ]; then
+    endpoints="${ep}"
+  else
+    endpoints="${endpoints},${ep}"
+  fi
+done
+peer_url="${scheme}://${POD_NAME}.${ETCD_SERVICE_NAME}.${POD_NAMESPACE}.svc.cluster.local:2380"
+
+export ETCDCTL_API=3
+members="$(etcdctl ${etcdctl_tls_args} --endpoints="${endpoints}" member list -w simple)"
+old_id="$(printf '%s\n' "${members}" | awk -F',' -v name="${POD_NAME}" '{gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $3); if ($3 == name) {print $1; exit}}')"
+if [ -n "${old_id}" ]; then
+  echo "removing stale member ${POD_NAME} (${old_id})"
+  etcdctl ${etcdctl_tls_args} --endpoints="${endpoints}" member remove "${old_id}"
+else
+  echo "no stale member named ${POD_NAME} found"
+fi
+
+echo "adding member ${POD_NAME} with peer URL ${peer_url}"
+etcdctl ${etcdctl_tls_args} --endpoints="${endpoints}" member add "${POD_NAME}" --peer-urls="${peer_url}"
+`}
+	volumeMounts := []corev1.VolumeMount{{Name: volumeName, MountPath: etcdDataDir, SubPathExpr: "$(POD_NAME)"}}
+	if ec.Spec.TLS != nil {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: "client-secret", MountPath: etcdProbeCertMountPath})
+	}
+	return corev1.Container{
+		Name:         resetMemberContainerName,
+		Image:        image,
+		Command:      []string{"/bin/sh", "-c"},
+		Args:         args,
+		VolumeMounts: volumeMounts,
+		Env: []corev1.EnvVar{
+			{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
+			{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
+			{Name: "ETCD_SERVICE_NAME", Value: ec.Name},
+			{Name: "ETCD_REPLICAS", Value: strconv.Itoa(ec.Spec.Size)},
+		},
+	}
+}
+
+func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1alpha1.EtcdCluster, c client.Client, replicas int32, scheme *runtime.Scheme, options ...StatefulSetOptions) error {
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ec.Name,
@@ -159,12 +344,11 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		},
 	}
 
-	labels := map[string]string{
-		"app":        ec.Name,
-		"controller": ec.Name,
-	}
+	labels := labelsForEtcdCluster(ec)
+	stsOptions := firstStatefulSetOptions(options)
 
 	podSpec := corev1.PodSpec{
+		PriorityClassName: defaultEtcdPriorityClassName,
 		Containers: []corev1.Container{
 			{
 				Name:    "etcd",
@@ -212,11 +396,20 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		},
 	}
 
+	probeImage := stsOptions.ProbeImage
+	if probeImage != "" {
+		podSpec.Containers[0].LivenessProbe = etcdProbe("/healthz", 5, 5, 30)
+		podSpec.Containers[0].ReadinessProbe = etcdProbe("/readyz", 5, 15, 30)
+		podSpec.Containers[0].StartupProbe = etcdProbe("/readyz", 10, 18, 30)
+		podSpec.Containers = append(podSpec.Containers, probeContainerForEtcdCluster(ec, probeImage))
+	}
+
 	// mount server and peer certificate secret to each pods of the statefulset via PodSpec
 	var certVolume []corev1.Volume
 	serverCertName := getServerCertName(ec.Name)
 	peerCertName := getPeerCertName(ec.Name)
 	if ec.Spec.TLS != nil {
+		clientCertName := getClientCertName(ec.Name)
 		serverCertVolume := corev1.Volume{
 			Name: "server-secret",
 			VolumeSource: corev1.VolumeSource{
@@ -230,6 +423,14 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 			},
 		}
 		certVolume = append(certVolume, serverCertVolume, peerCertVolume)
+		if probeImage != "" || (ec.Spec.StorageSpec != nil && ec.Spec.Recovery != nil && ec.Spec.Recovery.Enabled) {
+			certVolume = append(certVolume, corev1.Volume{
+				Name: "client-secret",
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{SecretName: clientCertName},
+				},
+			})
+		}
 
 		certVolumeMount := []corev1.VolumeMount{
 			{
@@ -246,6 +447,11 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 	}
 	if len(certVolume) != 0 {
 		podSpec.Volumes = certVolume
+	}
+
+	applyPodTemplateSpec(ec.Spec.PodTemplate, &podSpec)
+	if ec.Spec.StorageSpec != nil && ec.Spec.Recovery != nil && ec.Spec.Recovery.Enabled {
+		podSpec.InitContainers = append(podSpec.InitContainers, resetMemberInitContainerForEtcdCluster(ec))
 	}
 
 	// Prepare pod template metadata
@@ -271,8 +477,9 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 	maps.Copy(podTemplateMetadata.Labels, labels)
 
 	stsSpec := appsv1.StatefulSetSpec{
-		Replicas:    &replicas,
-		ServiceName: ec.Name,
+		Replicas:            &replicas,
+		ServiceName:         ec.Name,
+		PodManagementPolicy: appsv1.ParallelPodManagement,
 		Selector: &metav1.LabelSelector{
 			MatchLabels: labels,
 		},
@@ -340,16 +547,27 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 		}
 	}
 
+	isCreate := true
+	if err := c.Get(ctx, types.NamespacedName{Name: ec.Name, Namespace: ec.Namespace}, &appsv1.StatefulSet{}); err != nil {
+		if !k8serrors.IsNotFound(err) {
+			return err
+		}
+	} else {
+		isCreate = false
+	}
+
 	logger.Info("Now creating/updating statefulset", "name", ec.Name, "namespace", ec.Namespace, "replicas", replicas)
 	_, err := controllerutil.CreateOrPatch(ctx, c, sts, func() error {
-		// Define or update the desired spec
-		sts.ObjectMeta = metav1.ObjectMeta{
-			Name:      ec.Name,
-			Namespace: ec.Namespace,
+		if isCreate {
+			sts.Spec = stsSpec
+		} else {
+			sts.Spec.Replicas = stsSpec.Replicas
+			sts.Spec.Template = stsSpec.Template
 		}
-		sts.Spec = stsSpec
 
-		// Set ower reference
+		sts.Labels = labels
+
+		// Set owner reference
 		if err := controllerutil.SetControllerReference(ec, sts, scheme); err != nil {
 			return err
 		}
@@ -399,46 +617,119 @@ func waitForStatefulSetReady(ctx context.Context, logger logr.Logger, r client.C
 	return nil
 }
 
+func applyMutableServiceFields(service *corev1.Service, labels map[string]string, publishNotReady bool, ports []corev1.ServicePort) {
+	service.Labels = labels
+	service.Spec.Selector = labels
+	service.Spec.PublishNotReadyAddresses = publishNotReady
+	service.Spec.Ports = ports
+}
+
 func createHeadlessServiceIfNotExist(ctx context.Context, logger logr.Logger, c client.Client, ec *ecv1alpha1.EtcdCluster, scheme *runtime.Scheme) error {
-	service := &corev1.Service{}
-	err := c.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, service)
-
-	if err != nil {
-		if k8serrors.IsNotFound(err) {
-			logger.Info("Headless service does not exist. Creating headless service")
-
-			labels := map[string]string{
-				"app":        ec.Name,
-				"controller": ec.Name,
-			}
-			// Create the headless service
-			headlessSvc := &corev1.Service{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      ec.Name,
-					Namespace: ec.Namespace,
-					Labels:    labels,
-				},
-				Spec: corev1.ServiceSpec{
-					ClusterIP:                "None", // Key for headless service
-					Selector:                 labels,
-					PublishNotReadyAddresses: true,
-				},
-			}
-
-			// Set owner reference
-			if err := controllerutil.SetControllerReference(ec, headlessSvc, scheme); err != nil {
-				return err
-			}
-
-			if createErr := c.Create(ctx, headlessSvc); createErr != nil {
-				return fmt.Errorf("failed to create headless service: %w", createErr)
-			}
-			logger.Info("Headless service created successfully")
-
-			return nil
-		}
-		return fmt.Errorf("failed to get headless service: %w", err)
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ec.Name,
+			Namespace: ec.Namespace,
+		},
 	}
+	labels := labelsForEtcdCluster(ec)
+
+	isCreate := true
+	if err := c.Get(ctx, types.NamespacedName{Name: ec.Name, Namespace: ec.Namespace}, &corev1.Service{}); err != nil {
+		if !k8serrors.IsNotFound(err) {
+			return err
+		}
+	} else {
+		isCreate = false
+	}
+
+	logger.Info("Now creating/updating headless service", "name", ec.Name, "namespace", ec.Namespace)
+	_, err := controllerutil.CreateOrPatch(ctx, c, service, func() error {
+		if isCreate {
+			service.Spec.ClusterIP = "None" // Key for headless service
+		}
+		applyMutableServiceFields(service, labels, true, nil)
+		return controllerutil.SetControllerReference(ec, service, scheme)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create or patch headless service: %w", err)
+	}
+	logger.Info("Headless service created/updated successfully")
+	return nil
+}
+
+func createClientServiceIfNotExist(ctx context.Context, logger logr.Logger, c client.Client, ec *ecv1alpha1.EtcdCluster, scheme *runtime.Scheme) error {
+	serviceName := clientServiceNameForEtcdCluster(ec)
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName,
+			Namespace: ec.Namespace,
+		},
+	}
+	labels := labelsForEtcdCluster(ec)
+	ports := []corev1.ServicePort{
+		{
+			Name:       "client",
+			Port:       2379,
+			TargetPort: intstr.FromString("client"),
+		},
+	}
+
+	isCreate := true
+	if err := c.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: ec.Namespace}, &corev1.Service{}); err != nil {
+		if !k8serrors.IsNotFound(err) {
+			return err
+		}
+	} else {
+		isCreate = false
+	}
+
+	logger.Info("Now creating/updating client service", "name", serviceName, "namespace", ec.Namespace)
+	_, err := controllerutil.CreateOrPatch(ctx, c, service, func() error {
+		if isCreate {
+			service.Spec.ClusterIP = "None"
+		}
+		applyMutableServiceFields(service, labels, false, ports)
+		return controllerutil.SetControllerReference(ec, service, scheme)
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create or patch client service: %w", err)
+	}
+	logger.Info("Client service created/updated successfully", "name", serviceName)
+	return nil
+}
+
+func createOrPatchPodDisruptionBudget(ctx context.Context, logger logr.Logger, c client.Client, ec *ecv1alpha1.EtcdCluster, scheme *runtime.Scheme) error {
+	pdb := &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ec.Name,
+			Namespace: ec.Namespace,
+		},
+	}
+
+	labels := labelsForEtcdCluster(ec)
+	maxUnavailable := intstr.FromInt(1)
+	unhealthyPodEvictionPolicy := policyv1.AlwaysAllow
+
+	logger.Info("Now creating/updating pod disruption budget", "name", ec.Name, "namespace", ec.Namespace)
+	_, err := controllerutil.CreateOrPatch(ctx, c, pdb, func() error {
+		pdb.Labels = labels
+		pdb.Spec.MaxUnavailable = &maxUnavailable
+		pdb.Spec.MinAvailable = nil
+		pdb.Spec.Selector = &metav1.LabelSelector{
+			MatchLabels: labels,
+		}
+		pdb.Spec.UnhealthyPodEvictionPolicy = &unhealthyPodEvictionPolicy
+
+		if err := controllerutil.SetControllerReference(ec, pdb, scheme); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	logger.Info("Pod disruption budget created/updated", "name", ec.Name, "namespace", ec.Namespace)
 	return nil
 }
 
@@ -473,7 +764,7 @@ func newEtcdClusterState(ec *ecv1alpha1.EtcdCluster, replica int) *corev1.Config
 	}
 
 	var initialCluster []string
-	for i := 0; i < replica; i++ {
+	for i := range replica {
 		name, peerURL := peerEndpointForOrdinalIndex(ec, i)
 		initialCluster = append(initialCluster, fmt.Sprintf("%s=%s", name, peerURL))
 	}
@@ -539,10 +830,8 @@ func getStatefulSet(ctx context.Context, c client.Client, name, namespace string
 func clientEndpointsFromStatefulsets(sts *appsv1.StatefulSet, tlsConfig *tls.Config) []string {
 	var endpoints []string
 	replica := int(*sts.Spec.Replicas)
-	if replica > 0 {
-		for i := 0; i < replica; i++ {
-			endpoints = append(endpoints, clientEndpointForOrdinalIndex(sts, i, tlsConfig))
-		}
+	for i := range replica {
+		endpoints = append(endpoints, clientEndpointForOrdinalIndex(sts, i, tlsConfig))
 	}
 	return endpoints
 }
@@ -619,6 +908,16 @@ func getPeerCertName(etcdClusterName string) string {
 	return peerCertName
 }
 
+func defaultCertificateDNSNames(ec *ecv1alpha1.EtcdCluster) []string {
+	clientServiceName := clientServiceNameForEtcdCluster(ec)
+	return []string{
+		fmt.Sprintf("*.%s.%s.svc", ec.Name, ec.Namespace),
+		fmt.Sprintf("*.%s.%s.svc.cluster.local", ec.Name, ec.Namespace),
+		fmt.Sprintf("%s.%s.svc", clientServiceName, ec.Namespace),
+		fmt.Sprintf("%s.%s.svc.cluster.local", clientServiceName, ec.Namespace),
+	}
+}
+
 func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
 	cmConfig := ec.Spec.TLS.ProviderCfg.CertManagerCfg
 	duration, err := time.ParseDuration(cmConfig.ValidityDuration)
@@ -626,16 +925,13 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config
 		log.Printf("Failed to parse ValidityDuration: %s", err)
 	}
 
-	var getAltNames certInterface.AltNames
-	if cmConfig.AltNames.DNSNames != nil {
-		getAltNames = certInterface.AltNames{
-			DNSNames: cmConfig.AltNames.DNSNames,
-		}
-	} else {
-		defaultDNSNames := []string{fmt.Sprintf("*.%s.%s.svc.cluster.local", ec.Name, ec.Namespace)}
-		getAltNames = certInterface.AltNames{
-			DNSNames: defaultDNSNames,
-		}
+	dnsNames := cmConfig.AltNames.DNSNames
+	if dnsNames == nil {
+		dnsNames = defaultCertificateDNSNames(ec)
+	}
+	getAltNames := certInterface.AltNames{
+		DNSNames: dnsNames,
+		IPs:      cmConfig.AltNames.IPs,
 	}
 
 	config := &certInterface.Config{
@@ -651,7 +947,7 @@ func createCMCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config
 	return config
 }
 
-func createAutoCertificateConfig(ec *ecv1alpha1.EtcdCluster) *certInterface.Config {
+func createAutoCertificateConfig(_ *ecv1alpha1.EtcdCluster) *certInterface.Config {
 	// TODO
 	config := &certInterface.Config{}
 	return config
@@ -671,49 +967,30 @@ func getClientCertificate(ctx context.Context, c client.Client, ec *ecv1alpha1.E
 	return getCertificatesContent(ctx, c, ec, getClientCertName(ec.Name))
 }
 
-func getServerCertificate(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster) (*certInterface.CertificateContent, error) {
-	return getCertificatesContent(ctx, c, ec, getServerCertName(ec.Name))
-}
-
-func getPeerCertificate(ctx context.Context, c client.Client, ec *ecv1alpha1.EtcdCluster) (*certInterface.CertificateContent, error) {
-	return getCertificatesContent(ctx, c, ec, getPeerCertName(ec.Name))
-}
-
 func createCertificate(ec *ecv1alpha1.EtcdCluster, ctx context.Context, c client.Client, certName string) error {
 	cert, certErr := certificate.NewProvider(certificate.ProviderType(ec.Spec.TLS.Provider), c, ec)
 	if certErr != nil {
 		// TODO: instead of error, set default autoConfig
 		return certErr
 	}
-	_, getCertError := cert.GetCertificateConfig(ctx, certName, ec.Namespace)
-	if getCertError != nil {
-		if k8serrors.IsNotFound(getCertError) {
-			log.Printf("Creating certificate: %s for etcd-operator: %s\n", certName, ec.Name)
-			switch {
-			case ec.Spec.TLS.ProviderCfg.AutoCfg != nil:
-				cmConfig := createAutoCertificateConfig(ec)
-				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
-				if createCertErr != nil {
-					log.Printf("Error creating certificate: %s", createCertErr)
-				}
-				return nil
-			case ec.Spec.TLS.ProviderCfg.CertManagerCfg != nil:
-				cmConfig := createCMCertificateConfig(ec)
-				createCertErr := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, cmConfig)
-				if createCertErr != nil {
-					log.Printf("Error creating certificate: %s", createCertErr)
-				}
-				return nil
-			default:
-				// TODO: Use AuthProvider, since both AutoCfg and CertManagerCfg is not present
-				log.Printf("Error creating certificate, valid certificate provider not defined.")
-				return nil
-			}
-		} else {
-			return fmt.Errorf("%s:Error getting certificate", getCertError)
-		}
+	if cert == nil {
+		return fmt.Errorf("certificate provider %q is not implemented", ec.Spec.TLS.Provider)
 	}
 
+	var config *certInterface.Config
+	switch {
+	case ec.Spec.TLS.ProviderCfg.AutoCfg != nil:
+		config = createAutoCertificateConfig(ec)
+	case ec.Spec.TLS.ProviderCfg.CertManagerCfg != nil:
+		config = createCMCertificateConfig(ec)
+	default:
+		return fmt.Errorf("no certificate provider config specified for %s", ec.Name)
+	}
+
+	if err := cert.EnsureCertificateSecret(ctx, certName, ec.Namespace, config); err != nil {
+		log.Printf("Error ensuring certificate: %s", err)
+		return err
+	}
 	return nil
 }
 

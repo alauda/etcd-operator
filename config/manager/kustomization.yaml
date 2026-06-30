@@ -6,3 +6,17 @@ images:
 - name: controller
   newName: etcd-operator
   newTag: v0.1
+replacements:
+- source:
+    kind: Deployment
+    name: controller-manager
+    fieldPath: spec.template.spec.containers.[name=manager].image
+  targets:
+  - select:
+      kind: Deployment
+      name: controller-manager
+    fieldPaths:
+    - spec.template.spec.containers.[name=manager].args.2
+    options:
+      delimiter: "="
+      index: 1

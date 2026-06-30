@@ -13,7 +13,7 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"strings"
+	"reflect"
 	"time"
 
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -53,17 +53,27 @@ func (cm *CertManagerProvider) EnsureCertificateSecret(ctx context.Context, secr
 	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, cmCertificate)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
-			valErr := cm.validateCertificateConfig(ctx, namespace, cfg)
-			if valErr != nil {
+			if valErr := cm.validateCertificateConfig(ctx, namespace, cfg); valErr != nil {
 				return valErr
 			}
-			err := cm.createCertificate(ctx, secretName, namespace, cfg)
-			if err != nil {
-				return err
-			}
-		} else {
+			return cm.createCertificate(ctx, secretName, namespace, cfg)
+		}
+		return err
+	}
+
+	if valErr := cm.validateCertificateConfig(ctx, namespace, cfg); valErr != nil {
+		return valErr
+	}
+	desiredSpec, err := certificateSpecForConfig(secretName, cfg)
+	if err != nil {
+		return err
+	}
+	if !certificateSpecEqual(cmCertificate.Spec, desiredSpec) {
+		cmCertificate.Spec = desiredSpec
+		if err := cm.Update(ctx, cmCertificate); err != nil {
 			return err
 		}
+		return nil
 	}
 
 	log.Printf("Valid certificate: %s present in namespace: %s, checking certificate status...", secretName, namespace)
@@ -106,9 +116,6 @@ func (cm *CertManagerProvider) EnsureCertificateSecret(ctx context.Context, secr
 func (cm *CertManagerProvider) GetCertificateContent(ctx context.Context, secretName, namespace string) (*interfaces.CertificateContent, error) {
 	secret := &corev1.Secret{}
 	err := cm.Get(ctx, client.ObjectKey{Name: secretName, Namespace: namespace}, secret)
-	if err != nil {
-		return nil, err
-	}
 	if err != nil {
 		return nil, err
 	}
@@ -250,9 +257,12 @@ func (cm *CertManagerProvider) GetCertificateConfig(ctx context.Context,
 
 	var ipAddresses []net.IP
 	if len(cmCertificate.Spec.IPAddresses) != 0 {
-		ipAddresses = make([]net.IP, len(cmCertificate.Spec.IPAddresses))
-	} else {
-		ipAddresses = nil
+		ipAddresses = make([]net.IP, 0, len(cmCertificate.Spec.IPAddresses))
+		for _, ipAddress := range cmCertificate.Spec.IPAddresses {
+			if ip := net.ParseIP(ipAddress); ip != nil {
+				ipAddresses = append(ipAddresses, ip)
+			}
+		}
 	}
 
 	cfg := &interfaces.Config{
@@ -336,19 +346,63 @@ func (cm *CertManagerProvider) validateCertificateConfig(ctx context.Context, na
 	return nil
 }
 
-// createCertificate creates a cert-manager Certificate resource in the specified namespace.
-// DNSNames and IPAddresses if not user-defined, will be set to default value in runtime:
-// fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local", ec.Name, index, ec.Name, ec.Namespace)
-// returns an error if the Certificate resource cannot be created.
-func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretName, namespace string,
-	cfg *interfaces.Config) error {
+func certificateSpecForConfig(secretName string, cfg *interfaces.Config) (certmanagerv1.CertificateSpec, error) {
 	issuerName, isValid := cfg.ExtraConfig[IssuerNameKey].(string)
 	if !isValid {
-		return fmt.Errorf("value for %s not correctly provided, try again", IssuerNameKey)
+		return certmanagerv1.CertificateSpec{}, fmt.Errorf("value for %s not correctly provided, try again", IssuerNameKey)
 	}
 	issuerKind, isValid := cfg.ExtraConfig[IssuerKindKey].(string)
 	if !isValid {
-		return fmt.Errorf("value for %s not correctly provided, try again", IssuerKindKey)
+		return certmanagerv1.CertificateSpec{}, fmt.Errorf("value for %s not correctly provided, try again", IssuerKindKey)
+	}
+
+	return certmanagerv1.CertificateSpec{
+		CommonName: cfg.CommonName,
+		Subject: &certmanagerv1.X509Subject{
+			Organizations: cfg.Organization,
+		},
+		SecretName:  secretName,
+		DNSNames:    cfg.AltNames.DNSNames,
+		IPAddresses: ipStrings(cfg.AltNames.IPs),
+		IssuerRef: cmmeta.ObjectReference{
+			Name: issuerName,
+			Kind: issuerKind,
+		},
+		Duration: &metav1.Duration{Duration: cfg.ValidityDuration},
+	}, nil
+}
+
+func ipStrings(ips []net.IP) []string {
+	if len(ips) == 0 {
+		return nil
+	}
+	result := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		if ip != nil {
+			result = append(result, ip.String())
+		}
+	}
+	return result
+}
+
+func certificateSpecEqual(current, desired certmanagerv1.CertificateSpec) bool {
+	return current.CommonName == desired.CommonName &&
+		reflect.DeepEqual(current.Subject, desired.Subject) &&
+		current.SecretName == desired.SecretName &&
+		reflect.DeepEqual(current.DNSNames, desired.DNSNames) &&
+		reflect.DeepEqual(current.IPAddresses, desired.IPAddresses) &&
+		current.IssuerRef.Name == desired.IssuerRef.Name &&
+		current.IssuerRef.Kind == desired.IssuerRef.Kind &&
+		reflect.DeepEqual(current.Duration, desired.Duration)
+}
+
+// createCertificate creates a cert-manager Certificate resource in the specified namespace.
+// returns an error if the Certificate resource cannot be created.
+func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretName, namespace string,
+	cfg *interfaces.Config) error {
+	certificateSpec, err := certificateSpecForConfig(secretName, cfg)
+	if err != nil {
+		return err
 	}
 
 	certificateResource := &certmanagerv1.Certificate{
@@ -356,20 +410,7 @@ func (cm *CertManagerProvider) createCertificate(ctx context.Context, secretName
 			Name:      secretName,
 			Namespace: namespace,
 		},
-		Spec: certmanagerv1.CertificateSpec{
-			CommonName: cfg.CommonName,
-			Subject: &certmanagerv1.X509Subject{
-				Organizations: cfg.Organization,
-			},
-			SecretName:  secretName,
-			DNSNames:    cfg.AltNames.DNSNames,
-			IPAddresses: strings.Fields(strings.Trim(fmt.Sprint(cfg.AltNames.IPs), "[]")),
-			IssuerRef: cmmeta.ObjectReference{
-				Name: issuerName,
-				Kind: issuerKind,
-			},
-			Duration: &metav1.Duration{Duration: cfg.ValidityDuration},
-		},
+		Spec: certificateSpec,
 	}
 
 	if err := controllerutil.SetControllerReference(cm.etcdCluster, certificateResource, cm.Scheme()); err != nil {
@@ -386,17 +427,23 @@ func parsePrivateKey(privateKeyData []byte) (crypto.PrivateKey, error) {
 		return nil, errors.New("failed to decode private key: invalid PEM")
 	}
 
-	// Parse the private key from the PEM block
+	// Parse the private key from the PEM block. cert-manager may create
+	// PKCS#8, PKCS#1 RSA, or SEC1 EC private keys depending on issuer/key
+	// configuration.
 	privateKey, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	if err != nil {
-		// Parse the private key in another format (e.g., RSA)
-		privateKey, err = x509.ParsePKCS1PrivateKey(block.Bytes)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse private key: %w", err)
-		}
+	if err == nil {
+		return privateKey, nil
 	}
 
-	return privateKey, nil
+	if rsaKey, rsaErr := x509.ParsePKCS1PrivateKey(block.Bytes); rsaErr == nil {
+		return rsaKey, nil
+	}
+
+	if ecKey, ecErr := x509.ParseECPrivateKey(block.Bytes); ecErr == nil {
+		return ecKey, nil
+	}
+
+	return nil, fmt.Errorf("failed to parse private key: %w", err)
 }
 
 // checkKeyPair checks if the private key matches the certificate by validating the public key
@@ -412,7 +459,7 @@ func checkKeyPair(cert *x509.Certificate, privateKey crypto.PrivateKey) error {
 		if !ok || !key.PublicKey.Equal(pub) {
 			return interfaces.ErrECDSAKeyPair
 		}
-	case *ed25519.PrivateKey:
+	case ed25519.PrivateKey:
 		pub, ok := cert.PublicKey.(ed25519.PublicKey)
 		if !ok || !bytes.Equal(key.Public().(ed25519.PublicKey), pub) {
 			return interfaces.ErrED25519KeyPair

@@ -3,12 +3,19 @@ package controller
 import (
 	"errors"
 	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -54,6 +61,138 @@ func TestReconcileStatefulSet(t *testing.T) {
 	if *sts.Spec.Replicas != 3 {
 		t.Fatalf("expected 3 replicas, got %d", *sts.Spec.Replicas)
 	}
+}
+
+func TestCreateOrPatchStatefulSetWithPhase2PodSpec(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-etcd",
+			Namespace: "default",
+		},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:    3,
+			Version: "3.5.17",
+			PodTemplate: &ecv1alpha1.PodTemplate{
+				Spec: &ecv1alpha1.EtcdPodTemplateSpec{
+					NodeSelector: map[string]string{"node-role.kubernetes.io/control-plane": ""},
+					Tolerations: []corev1.Toleration{
+						{Key: "node-role.kubernetes.io/control-plane", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+					},
+					Affinity: &corev1.Affinity{
+						NodeAffinity: &corev1.NodeAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+								NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+									MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "kubernetes.io/os", Operator: corev1.NodeSelectorOpIn, Values: []string{"linux"}}},
+								}},
+							},
+						},
+					},
+					TopologySpreadConstraints: []corev1.TopologySpreadConstraint{
+						{MaxSkew: 1, TopologyKey: "topology.kubernetes.io/zone", WhenUnsatisfiable: corev1.DoNotSchedule},
+					},
+					PriorityClassName: "custom-priority",
+				},
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+	assert.NoError(t, err)
+
+	sts := &appsv1.StatefulSet{}
+	err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, sts)
+	assert.NoError(t, err)
+	assert.Equal(t, appsv1.ParallelPodManagement, sts.Spec.PodManagementPolicy)
+
+	podSpec := sts.Spec.Template.Spec
+	assert.Equal(t, ec.Spec.PodTemplate.Spec.NodeSelector, podSpec.NodeSelector)
+	assert.Equal(t, ec.Spec.PodTemplate.Spec.Tolerations, podSpec.Tolerations)
+	assert.Equal(t, ec.Spec.PodTemplate.Spec.Affinity, podSpec.Affinity)
+	assert.Equal(t, ec.Spec.PodTemplate.Spec.TopologySpreadConstraints, podSpec.TopologySpreadConstraints)
+	assert.Equal(t, "custom-priority", podSpec.PriorityClassName)
+}
+
+func TestCreateOrPatchStatefulSetDefaultPriorityClassName(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+	assert.NoError(t, err)
+
+	sts := &appsv1.StatefulSet{}
+	err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, sts)
+	assert.NoError(t, err)
+	assert.Equal(t, defaultEtcdPriorityClassName, sts.Spec.Template.Spec.PriorityClassName)
+}
+
+func TestCreateOrPatchStatefulSetPreservesImmutableFieldsOnUpdate(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"},
+		Spec:       ecv1alpha1.EtcdClusterSpec{Size: 3, Version: "3.5.17"},
+	}
+	legacyLabels := map[string]string{"app": "legacy"}
+	existing := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: ec.Name, Namespace: ec.Namespace},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas:            pointerToInt32(1),
+			ServiceName:         "legacy-service",
+			PodManagementPolicy: appsv1.OrderedReadyPodManagement,
+			Selector:            &metav1.LabelSelector{MatchLabels: legacyLabels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: legacyLabels},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name:  "etcd",
+					Image: "old-image",
+				}}},
+			},
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
+				ObjectMeta: metav1.ObjectMeta{Name: "legacy-data"},
+			}},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+	err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+	assert.NoError(t, err)
+
+	updated := &appsv1.StatefulSet{}
+	err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, updated)
+	assert.NoError(t, err)
+	assert.Equal(t, int32(3), *updated.Spec.Replicas)
+	assert.Equal(t, "legacy-service", updated.Spec.ServiceName)
+	assert.Equal(t, appsv1.OrderedReadyPodManagement, updated.Spec.PodManagementPolicy)
+	assert.Equal(t, legacyLabels, updated.Spec.Selector.MatchLabels)
+	require.Len(t, updated.Spec.VolumeClaimTemplates, 1)
+	assert.Equal(t, "legacy-data", updated.Spec.VolumeClaimTemplates[0].Name)
+	assert.Equal(t, fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version), updated.Spec.Template.Spec.Containers[0].Image)
 }
 
 func TestWaitForStatefulSetReady(t *testing.T) {
@@ -175,6 +314,161 @@ func TestCreateHeadlessServiceIfNotExist(t *testing.T) {
 		err := createHeadlessServiceIfNotExist(ctx, logger, fakeClient, ec, scheme)
 		assert.NoError(t, err)
 	})
+}
+
+func TestCreateClientServiceIfNotExist(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"},
+	}
+
+	err := createClientServiceIfNotExist(ctx, logger, fakeClient, ec, scheme)
+	assert.NoError(t, err)
+
+	service := &corev1.Service{}
+	err = fakeClient.Get(ctx, client.ObjectKey{Name: "test-etcd-client", Namespace: "default"}, service)
+	assert.NoError(t, err)
+	assert.Equal(t, "None", service.Spec.ClusterIP)
+	assert.False(t, service.Spec.PublishNotReadyAddresses)
+	assert.Equal(t, labelsForEtcdCluster(ec), service.Spec.Selector)
+	require.Len(t, service.Spec.Ports, 1)
+	assert.Equal(t, "client", service.Spec.Ports[0].Name)
+	assert.Equal(t, int32(2379), service.Spec.Ports[0].Port)
+	assert.Equal(t, "client", service.Spec.Ports[0].TargetPort.StrVal)
+	assert.True(t, metav1.IsControlledBy(service, ec))
+}
+
+func TestCreateHeadlessServicePreservesDefaultedFieldsOnUpdate(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"}}
+	ipFamilyPolicy := corev1.IPFamilyPolicySingleStack
+	internalTrafficPolicy := corev1.ServiceInternalTrafficPolicyCluster
+	existing := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: ec.Name, Namespace: ec.Namespace},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:             "None",
+			ClusterIPs:            []string{"None"},
+			IPFamilies:            []corev1.IPFamily{corev1.IPv4Protocol},
+			IPFamilyPolicy:        &ipFamilyPolicy,
+			InternalTrafficPolicy: &internalTrafficPolicy,
+			Selector:              map[string]string{"old": "label"},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+	err := createHeadlessServiceIfNotExist(ctx, logger, fakeClient, ec, scheme)
+	assert.NoError(t, err)
+
+	service := &corev1.Service{}
+	err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, service)
+	assert.NoError(t, err)
+	assert.Equal(t, "None", service.Spec.ClusterIP)
+	assert.Equal(t, []string{"None"}, service.Spec.ClusterIPs)
+	assert.Equal(t, []corev1.IPFamily{corev1.IPv4Protocol}, service.Spec.IPFamilies)
+	assert.Equal(t, &ipFamilyPolicy, service.Spec.IPFamilyPolicy)
+	assert.Equal(t, &internalTrafficPolicy, service.Spec.InternalTrafficPolicy)
+	assert.Equal(t, labelsForEtcdCluster(ec), service.Spec.Selector)
+	assert.True(t, service.Spec.PublishNotReadyAddresses)
+}
+
+func TestCreateClientServicePreservesDefaultedFieldsOnUpdate(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"}}
+	serviceName := clientServiceNameForEtcdCluster(ec)
+	ipFamilyPolicy := corev1.IPFamilyPolicySingleStack
+	internalTrafficPolicy := corev1.ServiceInternalTrafficPolicyCluster
+	existing := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: serviceName, Namespace: ec.Namespace},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:             "None",
+			ClusterIPs:            []string{"None"},
+			IPFamilies:            []corev1.IPFamily{corev1.IPv4Protocol},
+			IPFamilyPolicy:        &ipFamilyPolicy,
+			InternalTrafficPolicy: &internalTrafficPolicy,
+			Selector:              map[string]string{"old": "label"},
+			Ports:                 []corev1.ServicePort{{Name: "old", Port: 1234}},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
+	err := createClientServiceIfNotExist(ctx, logger, fakeClient, ec, scheme)
+	assert.NoError(t, err)
+
+	service := &corev1.Service{}
+	err = fakeClient.Get(ctx, client.ObjectKey{Name: serviceName, Namespace: ec.Namespace}, service)
+	assert.NoError(t, err)
+	assert.Equal(t, "None", service.Spec.ClusterIP)
+	assert.Equal(t, []string{"None"}, service.Spec.ClusterIPs)
+	assert.Equal(t, []corev1.IPFamily{corev1.IPv4Protocol}, service.Spec.IPFamilies)
+	assert.Equal(t, &ipFamilyPolicy, service.Spec.IPFamilyPolicy)
+	assert.Equal(t, &internalTrafficPolicy, service.Spec.InternalTrafficPolicy)
+	assert.Equal(t, labelsForEtcdCluster(ec), service.Spec.Selector)
+	assert.False(t, service.Spec.PublishNotReadyAddresses)
+	require.Len(t, service.Spec.Ports, 1)
+	assert.Equal(t, "client", service.Spec.Ports[0].Name)
+	assert.Equal(t, int32(2379), service.Spec.Ports[0].Port)
+}
+
+func TestCreateOrPatchPodDisruptionBudget(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = policyv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	tests := []struct {
+		name string
+		size int
+	}{
+		{name: "size 5 allows one unavailable", size: 5},
+		{name: "size 3 allows one unavailable", size: 3},
+		{name: "size 2 allows one unavailable", size: 2},
+		{name: "size 1 allows one unavailable", size: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+			ec := &ecv1alpha1.EtcdCluster{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"},
+				Spec:       ecv1alpha1.EtcdClusterSpec{Size: tt.size, Version: "3.5.17"},
+			}
+
+			err := createOrPatchPodDisruptionBudget(ctx, logger, fakeClient, ec, scheme)
+			assert.NoError(t, err)
+
+			pdb := &policyv1.PodDisruptionBudget{}
+			err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, pdb)
+			assert.NoError(t, err)
+			require.NotNil(t, pdb.Spec.MaxUnavailable)
+			assert.Nil(t, pdb.Spec.MinAvailable)
+			assert.Equal(t, int32(1), pdb.Spec.MaxUnavailable.IntVal)
+			assert.Equal(t, labelsForEtcdCluster(ec), pdb.Spec.Selector.MatchLabels)
+			require.NotNil(t, pdb.Spec.UnhealthyPodEvictionPolicy)
+			assert.Equal(t, policyv1.AlwaysAllow, *pdb.Spec.UnhealthyPodEvictionPolicy)
+			assert.True(t, metav1.IsControlledBy(pdb, ec))
+		})
+	}
 }
 
 func TestClientEndpointForOrdinalIndex(t *testing.T) {
@@ -681,6 +975,43 @@ func TestCreateOrPatchStatefulSetWithPodLabels(t *testing.T) {
 	}
 }
 
+func TestCreateCMCertificateConfigDefaultDNSNames(t *testing.T) {
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"},
+		Spec: ecv1alpha1.EtcdClusterSpec{TLS: &ecv1alpha1.TLSCertificate{ProviderCfg: ecv1alpha1.ProviderConfig{CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
+			IssuerName: "issuer",
+			IssuerKind: "Issuer",
+		}}}},
+	}
+
+	config := createCMCertificateConfig(ec)
+	assert.Equal(t, []string{
+		"*.test-etcd.default.svc",
+		"*.test-etcd.default.svc.cluster.local",
+		"test-etcd-client.default.svc",
+		"test-etcd-client.default.svc.cluster.local",
+	}, config.AltNames.DNSNames)
+}
+
+func TestCreateCMCertificateConfigPreservesCustomDNSNamesAndIPs(t *testing.T) {
+	ip := net.ParseIP("10.0.0.1")
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"},
+		Spec: ecv1alpha1.EtcdClusterSpec{TLS: &ecv1alpha1.TLSCertificate{ProviderCfg: ecv1alpha1.ProviderConfig{CertManagerCfg: &ecv1alpha1.ProviderCertManagerConfig{
+			IssuerName: "issuer",
+			IssuerKind: "Issuer",
+			CommonConfig: ecv1alpha1.CommonConfig{AltNames: ecv1alpha1.AltNames{
+				DNSNames: []string{"custom.example.com"},
+				IPs:      []net.IP{ip},
+			}},
+		}}}},
+	}
+
+	config := createCMCertificateConfig(ec)
+	assert.Equal(t, []string{"custom.example.com"}, config.AltNames.DNSNames)
+	assert.Equal(t, []net.IP{ip}, config.AltNames.IPs)
+}
+
 func TestCreatingArgs(t *testing.T) {
 	tests := []struct {
 		testName       string
@@ -773,4 +1104,198 @@ func TestCreatingArgs(t *testing.T) {
 		})
 	}
 
+}
+
+func TestCreateOrPatchStatefulSetWithProbeSidecar(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:    3,
+			Version: "3.5.17",
+			TLS:     &ecv1alpha1.TLSCertificate{},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme, StatefulSetOptions{ProbeImage: "controller:latest"})
+	assert.NoError(t, err)
+
+	sts := &appsv1.StatefulSet{}
+	err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, sts)
+	assert.NoError(t, err)
+	require.Len(t, sts.Spec.Template.Spec.Containers, 2)
+
+	etcd := sts.Spec.Template.Spec.Containers[0]
+	require.NotNil(t, etcd.LivenessProbe)
+	require.NotNil(t, etcd.ReadinessProbe)
+	require.NotNil(t, etcd.StartupProbe)
+	assert.Equal(t, "/healthz", etcd.LivenessProbe.HTTPGet.Path)
+	assert.Equal(t, "/readyz", etcd.ReadinessProbe.HTTPGet.Path)
+	assert.Equal(t, "/readyz", etcd.StartupProbe.HTTPGet.Path)
+	assert.Equal(t, int32(5), etcd.LivenessProbe.PeriodSeconds)
+	assert.Equal(t, int32(15), etcd.ReadinessProbe.FailureThreshold)
+	assert.Equal(t, int32(18), etcd.StartupProbe.FailureThreshold)
+
+	probe := sts.Spec.Template.Spec.Containers[1]
+	assert.Equal(t, etcdProbeContainerName, probe.Name)
+	assert.Equal(t, "controller:latest", probe.Image)
+	assert.Equal(t, []string{"/etcd-probe"}, probe.Command)
+	assert.Contains(t, probe.Args, "--listen-address=:9980")
+	assert.Contains(t, probe.Args, "--endpoint=https://$(POD_NAME).$(ETCD_SERVICE_NAME).$(POD_NAMESPACE).svc.cluster.local:2379")
+	assert.Contains(t, probe.Args, "--cacert=/etc/etcd/certs/client/ca.crt")
+	assert.Contains(t, probe.Args, "--cert=/etc/etcd/certs/client/tls.crt")
+	assert.Contains(t, probe.Args, "--key=/etc/etcd/certs/client/tls.key")
+	require.Len(t, probe.VolumeMounts, 1)
+	assert.Equal(t, "client-secret", probe.VolumeMounts[0].Name)
+
+	var foundClientSecret bool
+	for _, v := range sts.Spec.Template.Spec.Volumes {
+		if v.Name == "client-secret" {
+			foundClientSecret = true
+			assert.Equal(t, getClientCertName(ec.Name), v.Secret.SecretName)
+		}
+	}
+	assert.True(t, foundClientSecret)
+}
+
+func TestCreateOrPatchStatefulSetWithResetMemberInitContainer(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:          3,
+			Version:       "3.5.17",
+			ImageRegistry: "registry/etcd",
+			StorageSpec: &ecv1alpha1.StorageSpec{
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+			},
+			TLS:      &ecv1alpha1.TLSCertificate{},
+			Recovery: &ecv1alpha1.EtcdClusterRecoverySpec{Enabled: true},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+	assert.NoError(t, err)
+
+	sts := &appsv1.StatefulSet{}
+	err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, sts)
+	assert.NoError(t, err)
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	reset := sts.Spec.Template.Spec.InitContainers[0]
+	assert.Equal(t, resetMemberContainerName, reset.Name)
+	assert.Equal(t, "registry/etcd:3.5.17", reset.Image)
+	assert.Equal(t, []string{"/bin/sh", "-c"}, reset.Command)
+	require.Len(t, reset.Args, 1)
+	assert.Contains(t, reset.Args[0], "/var/lib/etcd/member/snap/db")
+	assert.Contains(t, reset.Args[0], "member list -w simple")
+	assert.Contains(t, reset.Args[0], "member remove")
+	assert.Contains(t, reset.Args[0], "member add")
+	assert.NotContains(t, reset.Args[0], "\"name=\" name")
+	assert.NotContains(t, reset.Args[0], "member add \"${POD_NAME}\" --peer-urls=\"${peer_url}\" || true")
+
+	mounts := map[string]corev1.VolumeMount{}
+	for _, mount := range reset.VolumeMounts {
+		mounts[mount.Name] = mount
+	}
+	assert.Equal(t, etcdDataDir, mounts[volumeName].MountPath)
+	assert.Equal(t, etcdProbeCertMountPath, mounts["client-secret"].MountPath)
+
+	var hasClientSecret bool
+	for _, v := range sts.Spec.Template.Spec.Volumes {
+		if v.Name == "client-secret" {
+			hasClientSecret = true
+			assert.Equal(t, getClientCertName(ec.Name), v.Secret.SecretName)
+		}
+	}
+	assert.True(t, hasClientSecret)
+}
+
+func TestResetMemberInitContainerScriptParsesSimpleMemberList(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:          3,
+			Version:       "3.5.17",
+			ImageRegistry: "registry/etcd",
+			StorageSpec: &ecv1alpha1.StorageSpec{
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+			},
+			Recovery: &ecv1alpha1.EtcdClusterRecoverySpec{Enabled: true},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
+	require.NoError(t, err)
+
+	sts := &appsv1.StatefulSet{}
+	err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, sts)
+	require.NoError(t, err)
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	require.Len(t, sts.Spec.Template.Spec.InitContainers[0].Args, 1)
+	script := sts.Spec.Template.Spec.InitContainers[0].Args[0]
+
+	tmpDir := t.TempDir()
+	logPath := tmpDir + "/etcdctl.log"
+	fakeEtcdctl := tmpDir + "/etcdctl"
+	err = os.WriteFile(fakeEtcdctl, []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$ETCDCTL_LOG"
+case "$*" in
+  *"member list -w simple"*)
+    printf '%s\n' \
+      '1111111111111111, started, test-etcd-0, http://test-etcd-0.test-etcd.default.svc.cluster.local:2380, http://test-etcd-0.test-etcd.default.svc.cluster.local:2379, false' \
+      '2222222222222222, started, test-etcd-1, http://test-etcd-1.test-etcd.default.svc.cluster.local:2380, http://test-etcd-1.test-etcd.default.svc.cluster.local:2379, false' \
+      '3333333333333333, started, test-etcd-2, http://test-etcd-2.test-etcd.default.svc.cluster.local:2380, http://test-etcd-2.test-etcd.default.svc.cluster.local:2379, false'
+    ;;
+  *"member remove 3333333333333333"*) ;;
+  *"member add test-etcd-2"*) ;;
+  *) echo "unexpected etcdctl args: $*" >&2; exit 42 ;;
+esac
+`), 0755)
+	require.NoError(t, err)
+
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", script)
+	cmd.Env = append(os.Environ(),
+		"PATH="+tmpDir+":"+os.Getenv("PATH"),
+		"ETCDCTL_LOG="+logPath,
+		"POD_NAME=test-etcd-2",
+		"POD_NAMESPACE=default",
+		"ETCD_SERVICE_NAME=test-etcd",
+		"ETCD_REPLICAS=3",
+	)
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(output))
+
+	logBytes, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	calls := string(logBytes)
+	assert.Contains(t, calls, "member list -w simple")
+	assert.Contains(t, calls, "member remove 3333333333333333")
+	assert.Contains(t, calls, "member add test-etcd-2")
+	assert.NotContains(t, calls, "name=test-etcd-2")
+	assert.Less(t, strings.Index(calls, "member remove 3333333333333333"), strings.Index(calls, "member add test-etcd-2"))
 }

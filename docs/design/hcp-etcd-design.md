@@ -13,6 +13,8 @@ ACP Hosted Control Plane（**ACP HCP**）是 Alauda 基于 Kamaji 和 Cluster AP
 
 本设计对标 OCP HCP（HyperShift，§4）：本期落地前三项的高可用能力，并给出容灾方案（分级恢复 + etcd snapshot + Velero，§12），自动化与具体手册列入后续。范围见 §2。
 
+实施计划与 PR 拆分见 [HCP etcd operator 改造实施计划](./hcp-etcd-operator-implementation-plan.md)。
+
 ## 2. Goal / Non-Goal
 
 **Goal**
@@ -374,7 +376,9 @@ spec:
     clientCertificate: { ... }
 ```
 
-endpoint 与证书 Secret 命名稳定可预测。本设计采用 **方案 C：etcd-operator 内独立 reconciler 创建/更新 DataStore，Kamaji 引用该 DataStore**：
+endpoint 与证书 Secret 命名稳定可预测。TLS 证书沿用既有 etcd-operator + cert-manager CA Issuer 流程（参考：[Deploy Etcd Cluster](https://docs.alauda.io/hosted-control-plane/1.0/how_to/deploy-etcd-cluster.html)）：`EtcdCluster.spec.tls.providerCfg.certManagerCfg.issuerKind=Issuer`、`issuerName=<CA_ISSUER_NAME>` 指向 namespaced cert-manager `Issuer`，operator 从 `Issuer.spec.ca.secretName` 定位 CA Secret（`tls.crt` / `tls.key`），DataStore 的 `certificateAuthority` 引用该 CA Secret；`clientCertificate` 引用 operator 生成的 `<etcd>-client-tls`（`tls.crt` / `tls.key`）。首版自动发布 DataStore 只支持这种 namespaced CA Issuer 模式；`ClusterIssuer` / Vault / ACME / external issuer 因无法稳定定位同 namespace CA private key，需显式扩展后再支持。
+
+本设计采用 **方案 C：etcd-operator 内独立 reconciler 创建/更新 DataStore，Kamaji 引用该 DataStore**：
 
 | 方案 | 形态 | 取舍 |
 | --- | --- | --- |
@@ -655,6 +659,7 @@ flowchart TD
 
 - 底层实现：`api/v1alpha1/etcdcluster_types.go`、`internal/controller/etcdcluster_controller.go`、`internal/etcdutils/`
 - Kamaji CRD：`chart/charts/kamaji/templates/crds/`
+- 既有 etcd-operator cert-manager CA Issuer 部署流程：<https://docs.alauda.io/hosted-control-plane/1.0/how_to/deploy-etcd-cluster.html>
 - CAPI 节点 drain / PDB / `nodeDrainTimeout`：<https://cluster-api.sigs.k8s.io/tasks/automated-machine-management/machine_deletions>
 - OCP HCP 容灾调研（本仓库，§12 据此）：[docs/ocp-hcp-disaster-recovery-research.md](../ocp-hcp-disaster-recovery-research.md)
 - OCP HCP / HyperShift hosted etcd：

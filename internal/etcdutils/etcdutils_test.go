@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -94,6 +95,25 @@ func TestClusterHealth(t *testing.T) {
 		assert.Equal(t, "http://invalid:2379", health[0].Ep)
 		assert.Equal(t, false, health[0].Health)
 		assert.Equal(t, "context deadline exceeded", health[0].Error)
+	})
+}
+
+func TestAlarmList(t *testing.T) {
+	e := setupEtcdServer(t)
+	defer e.Close()
+
+	t.Run("ReturnsNoAlarms", func(t *testing.T) {
+		eps := []string{"http://localhost:2379"}
+		alarms, err := AlarmList(eps, nil)
+		assert.NoError(t, err)
+		assert.Empty(t, alarms)
+	})
+
+	t.Run("ReturnsErrorForInvalidEndpoint", func(t *testing.T) {
+		eps := []string{"http://invalid:2379"}
+		alarms, err := AlarmList(eps, nil)
+		assert.Error(t, err)
+		assert.Nil(t, alarms)
 	})
 }
 
@@ -231,6 +251,62 @@ func TestFindLeaderStatus(t *testing.T) {
 		assert.Equal(t, uint64(0), leader)
 		assert.Nil(t, leaderStatus)
 	})
+}
+
+func TestFindLeaderStatusSkipsNilStatusAndHeader(t *testing.T) {
+	logger := logr.Discard()
+	healthInfos := []EpHealth{
+		{Ep: "http://localhost:2379", Health: true},
+		{Ep: "http://localhost:2380", Health: true, Status: &clientv3.StatusResponse{}},
+		{
+			Ep:     "http://localhost:2381",
+			Health: true,
+			Status: &clientv3.StatusResponse{
+				Header: &etcdserverpb.ResponseHeader{MemberId: 3},
+				Leader: 3,
+			},
+		},
+	}
+
+	leader, leaderStatus := FindLeaderStatus(healthInfos, logger)
+
+	assert.Equal(t, uint64(3), leader)
+	require.NotNil(t, leaderStatus)
+	assert.Equal(t, uint64(3), leaderStatus.Header.MemberId)
+}
+
+func TestFindLearnerStatusSkipsNilStatusAndHeader(t *testing.T) {
+	logger := logr.Discard()
+	healthInfos := []EpHealth{
+		{Ep: "http://localhost:2379", Health: true},
+		{Ep: "http://localhost:2380", Health: true, Status: &clientv3.StatusResponse{IsLearner: true}},
+		{
+			Ep:     "http://localhost:2381",
+			Health: true,
+			Status: &clientv3.StatusResponse{
+				Header:    &etcdserverpb.ResponseHeader{MemberId: 3},
+				IsLearner: true,
+			},
+		},
+	}
+
+	learner, learnerStatus := FindLearnerStatus(healthInfos, logger)
+
+	assert.Equal(t, uint64(3), learner)
+	require.NotNil(t, learnerStatus)
+	assert.Equal(t, uint64(3), learnerStatus.Header.MemberId)
+}
+
+func TestIsLearnerReadyBoundary(t *testing.T) {
+	leaderStatus := &clientv3.StatusResponse{Header: &etcdserverpb.ResponseHeader{Revision: 100}}
+	learnerStatus := &clientv3.StatusResponse{Header: &etcdserverpb.ResponseHeader{Revision: 89}}
+	assert.False(t, IsLearnerReady(leaderStatus, learnerStatus))
+
+	learnerStatus.Header.Revision = 90
+	assert.True(t, IsLearnerReady(leaderStatus, learnerStatus))
+
+	learnerStatus.Header.Revision = 100
+	assert.True(t, IsLearnerReady(leaderStatus, learnerStatus))
 }
 
 func TestFindLearnerStatus(t *testing.T) {

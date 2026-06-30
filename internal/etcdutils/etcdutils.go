@@ -13,6 +13,7 @@ import (
 	"github.com/go-logr/logr"
 	"go.uber.org/zap"
 
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	"go.etcd.io/etcd/client/pkg/v3/logutil"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -51,6 +52,11 @@ type EpHealth struct {
 	Took   string `json:"took"`
 	Status *clientv3.StatusResponse
 	Error  string `json:"error,omitempty"`
+}
+
+type Alarm struct {
+	MemberID uint64
+	Type     etcdserverpb.AlarmType
 }
 
 type healthReport []EpHealth
@@ -94,6 +100,9 @@ func FindLeaderStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *clie
 	// Find the leader status
 	for i := range healthInfos {
 		status := healthInfos[i].Status
+		if status == nil || status.Header == nil {
+			continue
+		}
 		if status.Leader == status.Header.MemberId {
 			leader = status.Header.MemberId
 			leaderStatus = status
@@ -112,6 +121,9 @@ func FindLearnerStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *cli
 	var learnerStatus *clientv3.StatusResponse
 	logger.Info("Now checking if there is any pending learner member that needs to be promoted")
 	for i := range healthInfos {
+		if healthInfos[i].Status == nil || healthInfos[i].Status.Header == nil {
+			continue
+		}
 		if healthInfos[i].Status.IsLearner {
 			learner = healthInfos[i].Status.Header.MemberId
 			learnerStatus = healthInfos[i].Status
@@ -122,68 +134,66 @@ func FindLearnerStatus(healthInfos []EpHealth, logger logr.Logger) (uint64, *cli
 	return learner, learnerStatus
 }
 
-func ClusterHealth(eps []string, tlsConfig *tls.Config) ([]EpHealth, error) {
+func EndpointHealth(ctx context.Context, ep string, tlsConfig *tls.Config) EpHealth {
 	lg, err := logutil.CreateDefaultZapLogger(zap.InfoLevel)
 	if err != nil {
-		return nil, err
+		return EpHealth{Ep: ep, Health: false, Error: err.Error()}
 	}
 
-	var cfgs = make([]*clientv3.Config, 0, len(eps))
-	for _, ep := range eps {
-		cfg := &clientv3.Config{
-			Endpoints:            []string{ep},
-			DialTimeout:          2 * time.Second,
-			DialKeepAliveTime:    2 * time.Second,
-			DialKeepAliveTimeout: 6 * time.Second,
-			TLS:                  tlsConfig,
+	cfg := clientv3.Config{
+		Endpoints:            []string{ep},
+		DialTimeout:          2 * time.Second,
+		DialKeepAliveTime:    2 * time.Second,
+		DialKeepAliveTimeout: 6 * time.Second,
+		TLS:                  tlsConfig,
+		Logger:               lg.Named("client"),
+	}
+
+	cli, err := clientv3.New(cfg)
+	if err != nil {
+		return EpHealth{Ep: ep, Health: false, Error: err.Error()}
+	}
+	defer cli.Close()
+
+	startTs := time.Now()
+	// get a random key. As long as we can get the response
+	// without an error, the endpoint is healthy.
+	_, err = cli.Get(ctx, "health", clientv3.WithSerializable())
+	eh := EpHealth{Ep: ep, Health: false, Took: time.Since(startTs).String()}
+	if err == nil || errors.Is(err, rpctypes.ErrPermissionDenied) {
+		eh.Health = true
+	} else {
+		eh.Error = err.Error()
+	}
+
+	if eh.Health {
+		epStatus, err := cli.Status(ctx, ep)
+		if err != nil {
+			eh.Health = false
+			eh.Error = "Unable to fetch the status"
+		} else {
+			eh.Status = epStatus
+			if len(epStatus.Errors) > 0 {
+				eh.Health = false
+				eh.Error = strings.Join(epStatus.Errors, ",")
+			}
 		}
-
-		cfgs = append(cfgs, cfg)
 	}
+	return eh
+}
 
+func ClusterHealth(eps []string, tlsConfig *tls.Config) ([]EpHealth, error) {
 	healthCh := make(chan EpHealth, len(eps))
 
 	var wg sync.WaitGroup
-	for _, cfg := range cfgs {
+	for _, ep := range eps {
 		wg.Add(1)
-		go func(cfg *clientv3.Config) {
+		go func(ep string) {
 			defer wg.Done()
-
-			ep := cfg.Endpoints[0]
-			cfg.Logger = lg.Named("client")
-			cli, err := clientv3.New(*cfg)
-			if err != nil {
-				healthCh <- EpHealth{Ep: ep, Health: false, Error: err.Error()}
-				return
-			}
-			startTs := time.Now()
-			// get a random key. As long as we can get the response
-			// without an error, the endpoint is health.
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			_, err = cli.Get(ctx, "health", clientv3.WithSerializable())
-			eh := EpHealth{Ep: ep, Health: false, Took: time.Since(startTs).String()}
-			if err == nil || errors.Is(err, rpctypes.ErrPermissionDenied) {
-				eh.Health = true
-			} else {
-				eh.Error = err.Error()
-			}
-
-			if eh.Health {
-				epStatus, err := cli.Status(ctx, ep)
-				if err != nil {
-					eh.Health = false
-					eh.Error = "Unable to fetch the status"
-				} else {
-					eh.Status = epStatus
-					if len(epStatus.Errors) > 0 {
-						eh.Health = false
-						eh.Error = strings.Join(epStatus.Errors, ",")
-					}
-				}
-			}
-			cancel()
-			healthCh <- eh
-		}(cfg)
+			defer cancel()
+			healthCh <- EndpointHealth(ctx, ep, tlsConfig)
+		}(ep)
 	}
 	wg.Wait()
 	close(healthCh)
@@ -195,6 +205,42 @@ func ClusterHealth(eps []string, tlsConfig *tls.Config) ([]EpHealth, error) {
 	sort.Sort(healthReport(healthList))
 
 	return healthList, nil
+}
+
+func AlarmList(eps []string, tlsConfig *tls.Config) ([]Alarm, error) {
+	cfg := clientv3.Config{
+		Endpoints:            eps,
+		DialTimeout:          2 * time.Second,
+		DialKeepAliveTime:    2 * time.Second,
+		DialKeepAliveTimeout: 6 * time.Second,
+		TLS:                  tlsConfig,
+	}
+
+	c, err := clientv3.New(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer func() {
+		err := c.Close()
+		if err != nil {
+			cancel()
+			return
+		}
+		cancel()
+	}()
+
+	resp, err := c.AlarmList(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	alarms := make([]Alarm, 0, len(resp.Alarms))
+	for _, alarm := range resp.Alarms {
+		alarms = append(alarms, Alarm{MemberID: alarm.MemberID, Type: alarm.Alarm})
+	}
+	return alarms, nil
 }
 
 func AddMember(eps []string, peerURLs []string, learner bool, tlsConfig *tls.Config) (*clientv3.MemberAddResponse, error) {
