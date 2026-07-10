@@ -4,7 +4,6 @@ processor:
   ignoreTypes:
     - "Embedded[2-4]$"
   ignoreFields:
-    - "status$"
     - "TypeMeta$"
   customMarkers:
     - name: "hidefromdoc"

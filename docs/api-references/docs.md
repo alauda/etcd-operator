@@ -71,6 +71,9 @@ _Appears in:_
 | `kind` _string_ | `EtcdCluster` | | |
 | `metadata` _[ObjectMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#objectmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
 | `spec` _[EtcdClusterSpec](#etcdclusterspec)_ |  |  |  |
+| `status` _[EtcdClusterStatus](#etcdclusterstatus)_ |  |  |  |
+
+
 
 
 #### EtcdClusterList
@@ -89,6 +92,65 @@ EtcdClusterList contains a list of EtcdCluster.
 | `kind` _string_ | `EtcdClusterList` | | |
 | `metadata` _[ListMeta](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#listmeta-v1-meta)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
 | `items` _[EtcdCluster](#etcdcluster) array_ |  |  |  |
+
+
+#### EtcdClusterPhase
+
+_Underlying type:_ _string_
+
+EtcdClusterPhase describes the high-level observed phase of an EtcdCluster.
+
+
+
+_Appears in:_
+- [EtcdClusterStatus](#etcdclusterstatus)
+
+| Field | Description |
+| --- | --- |
+| `Pending` | EtcdClusterPhasePending indicates the cluster has not become ready yet.<br /> |
+| `Ready` | EtcdClusterPhaseReady indicates the cluster is ready and has quorum.<br /> |
+| `Degraded` | EtcdClusterPhaseDegraded indicates the cluster is running with reduced health or capacity.<br /> |
+| `Recovering` | EtcdClusterPhaseRecovering indicates the cluster has an active recovery operation.<br /> |
+| `Failed` | EtcdClusterPhaseFailed indicates the cluster cannot make progress without intervention.<br /> |
+
+
+#### EtcdClusterRecoverySpec
+
+
+
+EtcdClusterRecoverySpec configures automatic single-member recovery.
+
+
+
+_Appears in:_
+- [EtcdClusterSpec](#etcdclusterspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `enabled` _boolean_ | Enabled controls whether automatic single-member recovery is allowed. |  |  |
+| `gracePeriod` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#duration-v1-meta)_ | GracePeriod is the amount of time a member must remain unhealthy before recovery may start. |  |  |
+| `timeout` _[Duration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#duration-v1-meta)_ | Timeout is the maximum amount of time a single recovery attempt may run. |  |  |
+| `maxRetries` _integer_ | MaxRetries is the maximum number of recovery attempts for the same failed member. |  | Minimum: 0 <br /> |
+
+
+#### EtcdClusterRecoveryStatus
+
+
+
+EtcdClusterRecoveryStatus describes observed single-member recovery state.
+
+
+
+_Appears in:_
+- [EtcdClusterStatus](#etcdclusterstatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `lastResult` _[EtcdRecoveryResult](#etcdrecoveryresult)_ | LastResult is the result of the most recent recovery attempt. |  | Enum: [Succeeded Failed Blocked] <br /> |
+| `lastRecoveredMember` _string_ | LastRecoveredMember is the member name targeted by the most recent recovery attempt. |  |  |
+| `lastTransitionTime` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#time-v1-meta)_ | LastTransitionTime is the time the recovery status last changed. |  |  |
+| `retryCount` _integer_ | RetryCount is the number of recovery attempts made for the current failed member. |  | Minimum: 0 <br /> |
+| `message` _string_ | Message provides human-readable details about the latest recovery state. |  |  |
 
 
 #### EtcdClusterSpec
@@ -111,8 +173,89 @@ _Appears in:_
 | `tls` _[TLSCertificate](#tlscertificate)_ | TLS is the TLS certificate configuration to use for the etcd cluster and etcd operator. |  |  |
 | `etcdOptions` _string array_ | etcd configuration options are passed as command line arguments to the etcd container, refer to etcd documentation for configuration options applicable for the version of etcd being used. |  |  |
 | `podTemplate` _[PodTemplate](#podtemplate)_ | PodTemplate is the pod template to use for the etcd cluster. |  |  |
+| `recovery` _[EtcdClusterRecoverySpec](#etcdclusterrecoveryspec)_ | Recovery configures automatic single-member recovery behavior for the etcd cluster.<br />When unset or disabled, the controller will not perform automatic recovery actions. |  |  |
 
 
+#### EtcdClusterStatus
+
+
+
+EtcdClusterStatus defines the observed state of EtcdCluster.
+
+
+
+_Appears in:_
+- [EtcdCluster](#etcdcluster)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `phase` _[EtcdClusterPhase](#etcdclusterphase)_ | Phase is a high-level summary of the current cluster state. |  | Enum: [Pending Ready Degraded Recovering Failed] <br /> |
+| `readyReplicas` _integer_ | ReadyReplicas is the number of etcd pods currently considered ready. |  | Minimum: 0 <br /> |
+| `memberCount` _integer_ | MemberCount is the number of members currently observed in the etcd membership list. |  | Minimum: 0 <br /> |
+| `leaderID` _string_ | LeaderID is the etcd member ID of the current leader, when known. |  |  |
+| `members` _[EtcdMemberStatus](#etcdmemberstatus) array_ | Members contains the observed status of each etcd member. |  |  |
+| `recovery` _[EtcdClusterRecoveryStatus](#etcdclusterrecoverystatus)_ | Recovery contains the latest observed single-member recovery state. |  |  |
+| `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#condition-v1-meta) array_ | Conditions represent the latest available observations of the cluster state. |  |  |
+| `observedGeneration` _integer_ | ObservedGeneration is the most recent generation observed by the controller. |  | Minimum: 0 <br /> |
+
+
+#### EtcdMemberStatus
+
+
+
+EtcdMemberStatus describes an observed etcd member.
+
+
+
+_Appears in:_
+- [EtcdClusterStatus](#etcdclusterstatus)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | Name is the Kubernetes pod/member name associated with this etcd member. |  |  |
+| `id` _string_ | ID is the etcd member ID. |  |  |
+| `healthy` _boolean_ | Healthy indicates whether the member passed the latest health check. |  |  |
+| `leader` _boolean_ | Leader indicates whether this member is the current etcd leader. |  |  |
+| `learner` _boolean_ | Learner indicates whether this member is an etcd learner and not a voting member. |  |  |
+| `nodeName` _string_ | NodeName is the Kubernetes node currently running the member pod, when known. |  |  |
+
+
+#### EtcdPodTemplateSpec
+
+
+
+EtcdPodTemplateSpec contains the supported pod spec overrides for etcd pods.
+
+
+
+_Appears in:_
+- [PodTemplate](#podtemplate)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `nodeSelector` _object (keys:string, values:string)_ | NodeSelector is a selector which must be true for the pod to fit on a node. |  |  |
+| `tolerations` _[Toleration](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#toleration-v1-core) array_ | Tolerations are appended to the pod to allow scheduling onto nodes with matching taints. |  |  |
+| `affinity` _[Affinity](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#affinity-v1-core)_ | Affinity specifies the pod's scheduling constraints. |  |  |
+| `topologySpreadConstraints` _[TopologySpreadConstraint](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#topologyspreadconstraint-v1-core) array_ | TopologySpreadConstraints describes how the pods should be spread across topology domains. |  |  |
+| `priorityClassName` _string_ | PriorityClassName indicates the pod's priority class. |  |  |
+
+
+#### EtcdRecoveryResult
+
+_Underlying type:_ _string_
+
+EtcdRecoveryResult describes the result of a single-member recovery attempt.
+
+
+
+_Appears in:_
+- [EtcdClusterRecoveryStatus](#etcdclusterrecoverystatus)
+
+| Field | Description |
+| --- | --- |
+| `Succeeded` | EtcdRecoveryResultSucceeded indicates the last recovery attempt succeeded.<br /> |
+| `Failed` | EtcdRecoveryResultFailed indicates the last recovery attempt failed.<br /> |
+| `Blocked` | EtcdRecoveryResultBlocked indicates recovery was blocked by safety preconditions.<br /> |
 
 
 #### PodMetadata
@@ -128,8 +271,8 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `annotations` _object (keys:string, values:string)_ |  |  |  |
-| `labels` _object (keys:string, values:string)_ |  |  |  |
+| `annotations` _object (keys:string, values:string)_ | Annotations are added to the generated etcd pods. |  |  |
+| `labels` _object (keys:string, values:string)_ | Labels are added to the generated etcd pods. |  |  |
 
 
 #### PodTemplate
@@ -146,6 +289,7 @@ _Appears in:_
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
 | `metadata` _[PodMetadata](#podmetadata)_ | Refer to Kubernetes API documentation for fields of `metadata`. |  |  |
+| `spec` _[EtcdPodTemplateSpec](#etcdpodtemplatespec)_ | Spec contains the scheduling-related fields to apply to the etcd pods. |  |  |
 
 
 #### ProviderAutoConfig

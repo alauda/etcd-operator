@@ -13,6 +13,8 @@ ACP Hosted Control Plane（**ACP HCP**）是 Alauda 基于 Kamaji 和 Cluster AP
 
 本设计对标 OCP HCP（HyperShift，§4）：本期落地前三项的高可用能力，并给出容灾方案（分级恢复 + etcd snapshot + Velero，§12），自动化与具体手册列入后续。范围见 §2。
 
+实施计划与 PR 拆分见 [HCP etcd operator 改造实施计划](./hcp-etcd-operator-implementation-plan.md)。
+
 ## 2. Goal / Non-Goal
 
 **Goal**
@@ -334,12 +336,15 @@ operator 每轮 `CreateOrPatch` 把新镜像下发 → 默认 **RollingUpdate** 
 
 ### 8.7 reset-member initContainer
 
-每个 etcd pod 注入 init 容器，按**数据盘上有没有 etcd db** 决定——这是「带原数据 rejoin」与「丢数据后干净重入」的开关：
+参考 HyperShift managed etcd 的最终设计：`reset-member` 是幂等、安全的 initContainer，只在**空盘 + 现有集群可访问 + 成员表存在当前 Pod 对应旧 member**时重置成员表。
 
-- `/var/lib/etcd/member/snap/db` **存在** → 数据在，**不动**，带原数据 rejoin（换机 / 版本升级常态）。
-- **不存在**（空盘）→ 若集群可达且成员表里还挂同名旧 member，则 `member remove` 旧 ID + `member add` 新 peer（`initial-cluster-state=existing`）干净加入。**只对齐成员表、不删 PVC**。
+- `/var/lib/etcd/member/snap/db` **存在** → 数据在，直接 no-op，带原数据 rejoin（换机 / 版本升级常态）。
+- 数据盘**为空** → 只连接 client Service（`<name>-client.<namespace>.svc:2379`）执行 `member list`；不拼其它 ordinal Pod DNS。
+- `member list` **失败**（初始 bootstrap、quorum 不可用、暂无 ready endpoint）→ no-op，让 etcd 按当前 `ETCD_INITIAL_CLUSTER_STATE` 启动/重试。
+- `member list` **成功且包含当前 `POD_NAME`** → `member remove` 旧 ID，再 `member add <POD_NAME> --peer-urls=<pod>.<headless>.<ns>.svc:2380`，以 `existing` 成员身份干净重入。
+- `member list` **成功但不包含当前 `POD_NAME`** → no-op；正常 bootstrap / scale-out 由 controller 的既有流程处理。
 
-与 operator 删 PVC 的分工见 §10.2：operator 清数据、reset-member 对齐成员表。
+`reset-member` 不删除 PVC、不主动判定恢复目标；破坏性动作只由 controller 在 §10.2 的守卫通过后执行。
 
 ### 8.8 client Service
 
@@ -374,7 +379,9 @@ spec:
     clientCertificate: { ... }
 ```
 
-endpoint 与证书 Secret 命名稳定可预测。本设计采用 **方案 C：etcd-operator 内独立 reconciler 创建/更新 DataStore，Kamaji 引用该 DataStore**：
+endpoint 与证书 Secret 命名稳定可预测。TLS 证书沿用既有 etcd-operator + cert-manager CA Issuer 流程（参考：[Deploy Etcd Cluster](https://docs.alauda.io/hosted-control-plane/1.0/how_to/deploy-etcd-cluster.html)）：`EtcdCluster.spec.tls.providerCfg.certManagerCfg.issuerKind=Issuer`、`issuerName=<CA_ISSUER_NAME>` 指向 namespaced cert-manager `Issuer`，operator 从 `Issuer.spec.ca.secretName` 定位 CA Secret（`tls.crt` / `tls.key`），DataStore 的 `certificateAuthority` 引用该 CA Secret；`clientCertificate` 引用 operator 生成的 `<etcd>-client-tls`（`tls.crt` / `tls.key`）。首版自动发布 DataStore 只支持这种 namespaced CA Issuer 模式；`ClusterIssuer` / Vault / ACME / external issuer 因无法稳定定位同 namespace CA private key，需显式扩展后再支持。
+
+本设计采用 **方案 C：etcd-operator 内独立 reconciler 创建/更新 DataStore，Kamaji 引用该 DataStore**：
 
 | 方案 | 形态 | 取舍 |
 | --- | --- | --- |
@@ -655,6 +662,7 @@ flowchart TD
 
 - 底层实现：`api/v1alpha1/etcdcluster_types.go`、`internal/controller/etcdcluster_controller.go`、`internal/etcdutils/`
 - Kamaji CRD：`chart/charts/kamaji/templates/crds/`
+- 既有 etcd-operator cert-manager CA Issuer 部署流程：<https://docs.alauda.io/hosted-control-plane/1.0/how_to/deploy-etcd-cluster.html>
 - CAPI 节点 drain / PDB / `nodeDrainTimeout`：<https://cluster-api.sigs.k8s.io/tasks/automated-machine-management/machine_deletions>
 - OCP HCP 容灾调研（本仓库，§12 据此）：[docs/ocp-hcp-disaster-recovery-research.md](../ocp-hcp-disaster-recovery-research.md)
 - OCP HCP / HyperShift hosted etcd：
