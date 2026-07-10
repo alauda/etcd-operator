@@ -275,8 +275,11 @@ func probeContainerForEtcdCluster(ec *ecv1alpha1.EtcdCluster, image string) core
 	}
 }
 
-func resetMemberInitContainerForEtcdCluster(ec *ecv1alpha1.EtcdCluster) corev1.Container {
-	image := fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version)
+func etcdImageForEtcdCluster(ec *ecv1alpha1.EtcdCluster) string {
+	return fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version)
+}
+
+func resetMemberInitContainerForEtcdCluster(ec *ecv1alpha1.EtcdCluster, image string) corev1.Container {
 	args := []string{`set -eu
 if [ -f /var/lib/etcd/member/snap/db ]; then
   echo "member has data; reset-member no-op"
@@ -289,31 +292,52 @@ if [ -f /etc/etcd/certs/client/ca.crt ]; then
   scheme="https"
   etcdctl_tls_args="--cacert=/etc/etcd/certs/client/ca.crt --cert=/etc/etcd/certs/client/tls.crt --key=/etc/etcd/certs/client/tls.key"
 fi
-endpoints=""
-for i in $(seq 0 $((ETCD_REPLICAS - 1))); do
-  member_name="${ETCD_SERVICE_NAME}-${i}"
-  if [ "${member_name}" = "${POD_NAME}" ]; then
-    continue
-  fi
-  ep="${scheme}://${member_name}.${ETCD_SERVICE_NAME}.${POD_NAMESPACE}.svc.cluster.local:2379"
-  if [ -z "${endpoints}" ]; then
-    endpoints="${ep}"
-  else
-    endpoints="${endpoints},${ep}"
-  fi
-done
-peer_url="${scheme}://${POD_NAME}.${ETCD_SERVICE_NAME}.${POD_NAMESPACE}.svc.cluster.local:2380"
+endpoints="${scheme}://${ETCD_SERVICE_NAME}-client.${POD_NAMESPACE}.svc:2379"
+peer_url="${scheme}://${POD_NAME}.${ETCD_SERVICE_NAME}.${POD_NAMESPACE}.svc:2380"
+
+trim_space() {
+  value=$1
+  while :; do
+    case "${value}" in
+      ' '*) value=${value#' '} ;;
+      '	'*) value=${value#'	'} ;;
+      *) break ;;
+    esac
+  done
+  while :; do
+    case "${value}" in
+      *' ') value=${value%' '} ;;
+      *'	') value=${value%'	'} ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "${value}"
+}
 
 export ETCDCTL_API=3
-members="$(etcdctl ${etcdctl_tls_args} --endpoints="${endpoints}" member list -w simple)"
-old_id="$(printf '%s\n' "${members}" | awk -F',' -v name="${POD_NAME}" '{gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $3); if ($3 == name) {print $1; exit}}')"
-if [ -n "${old_id}" ]; then
-  echo "removing stale member ${POD_NAME} (${old_id})"
-  etcdctl ${etcdctl_tls_args} --endpoints="${endpoints}" member remove "${old_id}"
-else
-  echo "no stale member named ${POD_NAME} found"
+if ! members="$(etcdctl ${etcdctl_tls_args} --endpoints="${endpoints}" member list -w simple)"; then
+  echo "member list failed; reset-member no-op"
+  exit 0
 fi
 
+old_id=""
+while IFS=, read -r member_id _ member_name _; do
+  member_id="$(trim_space "${member_id}")"
+  member_name="$(trim_space "${member_name}")"
+  if [ "${member_name}" = "${POD_NAME}" ]; then
+    old_id="${member_id}"
+    break
+  fi
+done <<EOF
+${members}
+EOF
+if [ -z "${old_id}" ]; then
+  echo "no stale member named ${POD_NAME} found; reset-member no-op"
+  exit 0
+fi
+
+echo "removing stale member ${POD_NAME} (${old_id})"
+etcdctl ${etcdctl_tls_args} --endpoints="${endpoints}" member remove "${old_id}"
 echo "adding member ${POD_NAME} with peer URL ${peer_url}"
 etcdctl ${etcdctl_tls_args} --endpoints="${endpoints}" member add "${POD_NAME}" --peer-urls="${peer_url}"
 `}
@@ -331,7 +355,6 @@ etcdctl ${etcdctl_tls_args} --endpoints="${endpoints}" member add "${POD_NAME}" 
 			{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
 			{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"}}},
 			{Name: "ETCD_SERVICE_NAME", Value: ec.Name},
-			{Name: "ETCD_REPLICAS", Value: strconv.Itoa(ec.Spec.Size)},
 		},
 	}
 }
@@ -346,6 +369,7 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 
 	labels := labelsForEtcdCluster(ec)
 	stsOptions := firstStatefulSetOptions(options)
+	etcdImage := etcdImageForEtcdCluster(ec)
 
 	podSpec := corev1.PodSpec{
 		PriorityClassName: defaultEtcdPriorityClassName,
@@ -354,7 +378,7 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 				Name:    "etcd",
 				Command: []string{"/usr/local/bin/etcd"},
 				Args:    createArgs(ec.Name, ec.Spec.EtcdOptions, ec.Spec.TLS != nil),
-				Image:   fmt.Sprintf("%s:%s", ec.Spec.ImageRegistry, ec.Spec.Version),
+				Image:   etcdImage,
 				Env: []corev1.EnvVar{
 					{
 						Name: "POD_NAME",
@@ -451,7 +475,7 @@ func createOrPatchStatefulSet(ctx context.Context, logger logr.Logger, ec *ecv1a
 
 	applyPodTemplateSpec(ec.Spec.PodTemplate, &podSpec)
 	if ec.Spec.StorageSpec != nil && ec.Spec.Recovery != nil && ec.Spec.Recovery.Enabled {
-		podSpec.InitContainers = append(podSpec.InitContainers, resetMemberInitContainerForEtcdCluster(ec))
+		podSpec.InitContainers = append(podSpec.InitContainers, resetMemberInitContainerForEtcdCluster(ec, etcdImage))
 	}
 
 	// Prepare pod template metadata

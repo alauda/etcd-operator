@@ -336,12 +336,15 @@ operator 每轮 `CreateOrPatch` 把新镜像下发 → 默认 **RollingUpdate** 
 
 ### 8.7 reset-member initContainer
 
-每个 etcd pod 注入 init 容器，按**数据盘上有没有 etcd db** 决定——这是「带原数据 rejoin」与「丢数据后干净重入」的开关：
+参考 HyperShift managed etcd 的最终设计：`reset-member` 是幂等、安全的 initContainer，只在**空盘 + 现有集群可访问 + 成员表存在当前 Pod 对应旧 member**时重置成员表。
 
-- `/var/lib/etcd/member/snap/db` **存在** → 数据在，**不动**，带原数据 rejoin（换机 / 版本升级常态）。
-- **不存在**（空盘）→ 若集群可达且成员表里还挂同名旧 member，则 `member remove` 旧 ID + `member add` 新 peer（`initial-cluster-state=existing`）干净加入。**只对齐成员表、不删 PVC**。
+- `/var/lib/etcd/member/snap/db` **存在** → 数据在，直接 no-op，带原数据 rejoin（换机 / 版本升级常态）。
+- 数据盘**为空** → 只连接 client Service（`<name>-client.<namespace>.svc:2379`）执行 `member list`；不拼其它 ordinal Pod DNS。
+- `member list` **失败**（初始 bootstrap、quorum 不可用、暂无 ready endpoint）→ no-op，让 etcd 按当前 `ETCD_INITIAL_CLUSTER_STATE` 启动/重试。
+- `member list` **成功且包含当前 `POD_NAME`** → `member remove` 旧 ID，再 `member add <POD_NAME> --peer-urls=<pod>.<headless>.<ns>.svc:2380`，以 `existing` 成员身份干净重入。
+- `member list` **成功但不包含当前 `POD_NAME`** → no-op；正常 bootstrap / scale-out 由 controller 的既有流程处理。
 
-与 operator 删 PVC 的分工见 §10.2：operator 清数据、reset-member 对齐成员表。
+`reset-member` 不删除 PVC、不主动判定恢复目标；破坏性动作只由 controller 在 §10.2 的守卫通过后执行。
 
 ### 8.8 client Service
 

@@ -1203,10 +1203,18 @@ func TestCreateOrPatchStatefulSetWithResetMemberInitContainer(t *testing.T) {
 	assert.Equal(t, []string{"/bin/sh", "-c"}, reset.Command)
 	require.Len(t, reset.Args, 1)
 	assert.Contains(t, reset.Args[0], "/var/lib/etcd/member/snap/db")
+	assert.Contains(t, reset.Args[0], "${ETCD_SERVICE_NAME}-client.${POD_NAMESPACE}.svc:2379")
 	assert.Contains(t, reset.Args[0], "member list -w simple")
+	assert.Contains(t, reset.Args[0], "member list failed; reset-member no-op")
 	assert.Contains(t, reset.Args[0], "member remove")
 	assert.Contains(t, reset.Args[0], "member add")
+	assert.NotContains(t, reset.Args[0], ".svc.cluster.local:2379")
+	assert.NotContains(t, reset.Args[0], "ETCD_REPLICAS")
+	assert.NotContains(t, reset.Args[0], "seq ")
+	assert.NotContains(t, reset.Args[0], "awk")
 	assert.NotContains(t, reset.Args[0], "\"name=\" name")
+	assert.NotContains(t, reset.Args[0], "kubectl")
+	assert.NotContains(t, reset.Args[0], "rm -")
 	assert.NotContains(t, reset.Args[0], "member add \"${POD_NAME}\" --peer-urls=\"${peer_url}\" || true")
 
 	mounts := map[string]corev1.VolumeMount{}
@@ -1226,7 +1234,50 @@ func TestCreateOrPatchStatefulSetWithResetMemberInitContainer(t *testing.T) {
 	assert.True(t, hasClientSecret)
 }
 
-func TestResetMemberInitContainerScriptParsesSimpleMemberList(t *testing.T) {
+func TestCreateOrPatchStatefulSetUpdatesEtcdAndResetMemberImages(t *testing.T) {
+	ctx := t.Context()
+	logger := log.FromContext(ctx)
+
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+
+	ec := &ecv1alpha1.EtcdCluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"},
+		Spec: ecv1alpha1.EtcdClusterSpec{
+			Size:          3,
+			Version:       "3.5.21",
+			ImageRegistry: "registry/etcd",
+			StorageSpec: &ecv1alpha1.StorageSpec{
+				VolumeSizeRequest: resource.MustParse("1Gi"),
+			},
+			Recovery: &ecv1alpha1.EtcdClusterRecoverySpec{Enabled: true},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	require.NoError(t, createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme))
+
+	ec.Spec.ImageRegistry = "registry/custom-etcd"
+	ec.Spec.Version = "v3.5.28-260421"
+	require.NoError(t, createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme))
+
+	sts := &appsv1.StatefulSet{}
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, sts))
+	expectedImage := "registry/custom-etcd:v3.5.28-260421"
+
+	require.Len(t, sts.Spec.Template.Spec.Containers, 1)
+	assert.Equal(t, "etcd", sts.Spec.Template.Spec.Containers[0].Name)
+	assert.Equal(t, expectedImage, sts.Spec.Template.Spec.Containers[0].Image)
+
+	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
+	assert.Equal(t, resetMemberContainerName, sts.Spec.Template.Spec.InitContainers[0].Name)
+	assert.Equal(t, expectedImage, sts.Spec.Template.Spec.InitContainers[0].Image)
+}
+
+func resetMemberScriptForTest(t *testing.T) string {
+	t.Helper()
 	ctx := t.Context()
 	logger := log.FromContext(ctx)
 
@@ -1249,43 +1300,112 @@ func TestResetMemberInitContainerScriptParsesSimpleMemberList(t *testing.T) {
 	}
 
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
-	err := createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme)
-	require.NoError(t, err)
+	require.NoError(t, createOrPatchStatefulSet(ctx, logger, ec, fakeClient, 3, scheme))
 
 	sts := &appsv1.StatefulSet{}
-	err = fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, sts)
-	require.NoError(t, err)
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, sts))
 	require.Len(t, sts.Spec.Template.Spec.InitContainers, 1)
 	require.Len(t, sts.Spec.Template.Spec.InitContainers[0].Args, 1)
-	script := sts.Spec.Template.Spec.InitContainers[0].Args[0]
+	return sts.Spec.Template.Spec.InitContainers[0].Args[0]
+}
 
+func TestResetMemberInitContainerScriptNoOpsWhenMemberListFails(t *testing.T) {
+	script := resetMemberScriptForTest(t)
 	tmpDir := t.TempDir()
 	logPath := tmpDir + "/etcdctl.log"
 	fakeEtcdctl := tmpDir + "/etcdctl"
-	err = os.WriteFile(fakeEtcdctl, []byte(`#!/bin/sh
+	err := os.WriteFile(fakeEtcdctl, []byte(`#!/bin/sh
 printf '%s\n' "$*" >> "$ETCDCTL_LOG"
-case "$*" in
-  *"member list -w simple"*)
-    printf '%s\n' \
-      '1111111111111111, started, test-etcd-0, http://test-etcd-0.test-etcd.default.svc.cluster.local:2380, http://test-etcd-0.test-etcd.default.svc.cluster.local:2379, false' \
-      '2222222222222222, started, test-etcd-1, http://test-etcd-1.test-etcd.default.svc.cluster.local:2380, http://test-etcd-1.test-etcd.default.svc.cluster.local:2379, false' \
-      '3333333333333333, started, test-etcd-2, http://test-etcd-2.test-etcd.default.svc.cluster.local:2380, http://test-etcd-2.test-etcd.default.svc.cluster.local:2379, false'
-    ;;
-  *"member remove 3333333333333333"*) ;;
-  *"member add test-etcd-2"*) ;;
-  *) echo "unexpected etcdctl args: $*" >&2; exit 42 ;;
-esac
+exit 42
 `), 0755)
 	require.NoError(t, err)
 
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", script)
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", script)
 	cmd.Env = append(os.Environ(),
 		"PATH="+tmpDir+":"+os.Getenv("PATH"),
 		"ETCDCTL_LOG="+logPath,
 		"POD_NAME=test-etcd-2",
 		"POD_NAMESPACE=default",
 		"ETCD_SERVICE_NAME=test-etcd",
-		"ETCD_REPLICAS=3",
+	)
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(output))
+	assert.Contains(t, string(output), "member list failed; reset-member no-op")
+
+	logBytes, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	calls := string(logBytes)
+	assert.Contains(t, calls, "--endpoints=http://test-etcd-client.default.svc:2379 member list -w simple")
+	assert.NotContains(t, calls, "member remove")
+	assert.NotContains(t, calls, "member add")
+}
+
+func TestResetMemberInitContainerScriptNoOpsWhenPodNameIsNotMember(t *testing.T) {
+	script := resetMemberScriptForTest(t)
+	tmpDir := t.TempDir()
+	logPath := tmpDir + "/etcdctl.log"
+	fakeEtcdctl := tmpDir + "/etcdctl"
+	err := os.WriteFile(fakeEtcdctl, []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$ETCDCTL_LOG"
+case "$*" in
+  *"member list -w simple"*)
+    printf '%s\n' \
+      '1111111111111111, started, test-etcd-0, http://test-etcd-0.test-etcd.default.svc:2380, http://test-etcd-0.test-etcd.default.svc:2379, false' \
+      '2222222222222222, started, test-etcd-1, http://test-etcd-1.test-etcd.default.svc:2380, http://test-etcd-1.test-etcd.default.svc:2379, false'
+    ;;
+  *) echo "unexpected etcdctl args: $*" >&2; exit 42 ;;
+esac
+`), 0755)
+	require.NoError(t, err)
+
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", script)
+	cmd.Env = append(os.Environ(),
+		"PATH="+tmpDir+":"+os.Getenv("PATH"),
+		"ETCDCTL_LOG="+logPath,
+		"POD_NAME=test-etcd-2",
+		"POD_NAMESPACE=default",
+		"ETCD_SERVICE_NAME=test-etcd",
+	)
+	output, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(output))
+	assert.Contains(t, string(output), "no stale member named test-etcd-2 found; reset-member no-op")
+
+	logBytes, err := os.ReadFile(logPath)
+	require.NoError(t, err)
+	calls := string(logBytes)
+	assert.Contains(t, calls, "member list -w simple")
+	assert.NotContains(t, calls, "member remove")
+	assert.NotContains(t, calls, "member add")
+}
+
+func TestResetMemberInitContainerScriptRemovesAndAddsExistingPodMember(t *testing.T) {
+	script := resetMemberScriptForTest(t)
+	tmpDir := t.TempDir()
+	logPath := tmpDir + "/etcdctl.log"
+	fakeEtcdctl := tmpDir + "/etcdctl"
+	err := os.WriteFile(fakeEtcdctl, []byte(`#!/bin/sh
+printf '%s\n' "$*" >> "$ETCDCTL_LOG"
+case "$*" in
+  *"member list -w simple"*)
+    printf '%s\n' \
+      '1111111111111111, started, test-etcd-0, http://test-etcd-0.test-etcd.default.svc:2380, http://test-etcd-0.test-etcd.default.svc:2379, false' \
+      '2222222222222222, started, test-etcd-1, http://test-etcd-1.test-etcd.default.svc:2380, http://test-etcd-1.test-etcd.default.svc:2379, false' \
+      '3333333333333333, started, test-etcd-2, http://test-etcd-2.test-etcd.default.svc:2380, http://test-etcd-2.test-etcd.default.svc:2379, false'
+    ;;
+  *"member remove 3333333333333333"*) ;;
+  *"member add test-etcd-2"*"--peer-urls=http://test-etcd-2.test-etcd.default.svc:2380"*) ;;
+  *) echo "unexpected etcdctl args: $*" >&2; exit 42 ;;
+esac
+`), 0755)
+	require.NoError(t, err)
+
+	cmd := exec.CommandContext(t.Context(), "/bin/sh", "-c", script)
+	cmd.Env = append(os.Environ(),
+		"PATH="+tmpDir+":"+os.Getenv("PATH"),
+		"ETCDCTL_LOG="+logPath,
+		"POD_NAME=test-etcd-2",
+		"POD_NAMESPACE=default",
+		"ETCD_SERVICE_NAME=test-etcd",
 	)
 	output, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(output))
@@ -1293,9 +1413,10 @@ esac
 	logBytes, err := os.ReadFile(logPath)
 	require.NoError(t, err)
 	calls := string(logBytes)
-	assert.Contains(t, calls, "member list -w simple")
-	assert.Contains(t, calls, "member remove 3333333333333333")
-	assert.Contains(t, calls, "member add test-etcd-2")
+	assert.Contains(t, calls, "--endpoints=http://test-etcd-client.default.svc:2379 member list -w simple")
+	assert.Contains(t, calls, "--endpoints=http://test-etcd-client.default.svc:2379 member remove 3333333333333333")
+	assert.Contains(t, calls, "--endpoints=http://test-etcd-client.default.svc:2379 member add test-etcd-2 --peer-urls=http://test-etcd-2.test-etcd.default.svc:2380")
+	assert.NotContains(t, calls, "test-etcd-0.test-etcd.default.svc:2379,test-etcd-1.test-etcd.default.svc:2379")
 	assert.NotContains(t, calls, "name=test-etcd-2")
 	assert.Less(t, strings.Index(calls, "member remove 3333333333333333"), strings.Index(calls, "member add test-etcd-2"))
 }

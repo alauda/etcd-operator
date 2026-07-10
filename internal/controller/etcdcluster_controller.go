@@ -71,16 +71,19 @@ type EtcdClusterReconciler struct {
 // Every phase of Reconcile stores intermediate information here so that
 // subsequent phases can operate without additional lookups.
 type reconcileState struct {
-	cluster              *ecv1alpha1.EtcdCluster      // cluster custom resource currently being reconciled
-	sts                  *appsv1.StatefulSet          // associated StatefulSet for the cluster
-	tlsConfig            *tls.Config                  // TLS configuration for the etcd cluster
-	memberListResp       *clientv3.MemberListResponse // member list fetched from the etcd cluster
-	memberHealth         []etcdutils.EpHealth         // health information for each etcd member
-	memberAlarms         []etcdutils.Alarm            // alarms observed from etcd AlarmList
-	alarmListErr         error                        // AlarmList error; recovery fails closed when set
-	pods                 []corev1.Pod                 // pods owned by the StatefulSet
-	jobs                 []batchv1.Job                // recovery jobs owned by the cluster
-	recoveryConditionSet bool                         // true when this reconcile directly set the recovery condition
+	cluster                   *ecv1alpha1.EtcdCluster      // cluster custom resource currently being reconciled
+	sts                       *appsv1.StatefulSet          // associated StatefulSet for the cluster
+	tlsConfig                 *tls.Config                  // TLS configuration for the etcd cluster
+	memberListResp            *clientv3.MemberListResponse // member list fetched from the etcd cluster
+	memberHealth              []etcdutils.EpHealth         // health information for each etcd member
+	memberAlarms              []etcdutils.Alarm            // alarms observed from etcd AlarmList
+	alarmListErr              error                        // AlarmList error; recovery fails closed when set
+	pods                      []corev1.Pod                 // pods owned by the StatefulSet
+	jobs                      []batchv1.Job                // recovery jobs owned by the cluster
+	recoveryConditionSet      bool                         // true when this reconcile directly set the recovery condition
+	dataStoreConditionSet     bool                         // true when this reconcile directly set the DataStore condition
+	dataStoreConditionChanged bool                         // true when this reconcile changed the DataStore condition
+	readyGuardConditionSet    bool                         // true when this reconcile directly set a Ready guard condition
 }
 
 // +kubebuilder:rbac:groups=operator.etcd.io,resources=etcdclusters,verbs=get;list;watch;create;update;patch;delete
@@ -227,6 +230,9 @@ func (r *EtcdClusterReconciler) reconcileStatefulSet(ctx context.Context, logger
 
 func normalizeEtcdVersion(v string) (major, minor, patch int, err error) {
 	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	if idx := strings.IndexAny(v, "-+"); idx >= 0 {
+		v = v[:idx]
+	}
 	parts := strings.Split(v, ".")
 	if len(parts) < 2 || len(parts) > 3 {
 		return 0, 0, 0, fmt.Errorf("invalid etcd version %q", v)
@@ -292,6 +298,7 @@ func (r *EtcdClusterReconciler) isVersionUpgradeAllowed(ctx context.Context, s *
 			Reason:  "EtcdVersionUpgradeBlocked",
 			Message: err.Error(),
 		}, s.cluster.Generation)
+		s.readyGuardConditionSet = true
 		if r.Recorder != nil {
 			r.Recorder.Event(s.cluster, corev1.EventTypeWarning, "EtcdVersionUpgradeBlocked", err.Error())
 		}
@@ -308,6 +315,7 @@ func (r *EtcdClusterReconciler) isVersionUpgradeAllowed(ctx context.Context, s *
 			Reason:  "EtcdVersionUpgradeBlocked",
 			Message: err.Error(),
 		}, s.cluster.Generation)
+		s.readyGuardConditionSet = true
 		if r.Recorder != nil {
 			r.Recorder.Event(s.cluster, corev1.EventTypeWarning, "EtcdVersionUpgradeBlocked", err.Error())
 		}
@@ -331,6 +339,7 @@ func (r *EtcdClusterReconciler) bootstrapStatefulSet(ctx context.Context, s *rec
 	if s.sts != nil && s.sts.Spec.PodManagementPolicy != appsv1.ParallelPodManagement {
 		message := "existing StatefulSet uses immutable podManagementPolicy OrderedReady; migrate by safely recreating the StatefulSet with podManagementPolicy Parallel while preserving PVCs"
 		setCondition(&s.cluster.Status.Conditions, metav1.Condition{Type: string(ecv1alpha1.EtcdClusterReady), Status: metav1.ConditionFalse, Reason: "StatefulSetPodManagementPolicyNeedsMigration", Message: message}, s.cluster.Generation)
+		s.readyGuardConditionSet = true
 		if r.Recorder != nil {
 			r.Recorder.Event(s.cluster, corev1.EventTypeWarning, "StatefulSetPodManagementPolicyNeedsMigration", message)
 		}
@@ -767,7 +776,7 @@ func (r *EtcdClusterReconciler) createRecoveryJob(ctx context.Context, s *reconc
 		job.Spec.TTLSecondsAfterFinished = &ttl
 		job.Spec.Template.ObjectMeta.Labels = labels
 		job.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyNever
-		image := fmt.Sprintf("%s:%s", s.cluster.Spec.ImageRegistry, s.cluster.Spec.Version)
+		image := etcdImageForEtcdCluster(s.cluster)
 		if s.cluster.Spec.ImageRegistry == "" {
 			image = "busybox:1.36"
 		}
@@ -1127,8 +1136,24 @@ func removeCondition(conditions *[]metav1.Condition, conditionType ecv1alpha1.Et
 	}
 }
 
+func setDataStoreCondition(s *reconcileState, cond metav1.Condition) {
+	before := s.cluster.Status.DeepCopy()
+	setCondition(&s.cluster.Status.Conditions, cond, s.cluster.Generation)
+	s.dataStoreConditionSet = true
+	s.dataStoreConditionChanged = s.dataStoreConditionChanged || !reflect.DeepEqual(*before, s.cluster.Status)
+}
+
+func removeDataStoreCondition(s *reconcileState) {
+	before := s.cluster.Status.DeepCopy()
+	removeCondition(&s.cluster.Status.Conditions, ecv1alpha1.DataStoreReady)
+	changed := !reflect.DeepEqual(*before, s.cluster.Status)
+	s.dataStoreConditionSet = s.dataStoreConditionSet || changed
+	s.dataStoreConditionChanged = s.dataStoreConditionChanged || changed
+}
+
 func buildClusterStatus(ec *ecv1alpha1.EtcdCluster, sts *appsv1.StatefulSet, pods []corev1.Pod, memberList *clientv3.MemberListResponse, health []etcdutils.EpHealth) ecv1alpha1.EtcdClusterStatus {
 	status := ec.Status.DeepCopy()
+	removeCondition(&status.Conditions, ecv1alpha1.DataStoreReady)
 	status.ObservedGeneration = ec.Generation
 	if sts != nil {
 		status.ReadyReplicas = sts.Status.ReadyReplicas
@@ -1223,7 +1248,7 @@ func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileSt
 	newStatus := buildClusterStatus(s.cluster, s.sts, s.pods, s.memberListResp, s.memberHealth)
 	// Preserve any condition set directly by safety guards in this reconcile.
 	for _, cond := range s.cluster.Status.Conditions {
-		if cond.Type == string(ecv1alpha1.EtcdClusterReady) && (cond.Reason == "EtcdVersionUpgradeBlocked" || cond.Reason == "StatefulSetPodManagementPolicyNeedsMigration") {
+		if cond.Type == string(ecv1alpha1.EtcdClusterReady) && s.readyGuardConditionSet {
 			setCondition(&newStatus.Conditions, cond, s.cluster.Generation)
 			newStatus.Phase = ecv1alpha1.EtcdClusterPhaseDegraded
 		}
@@ -1233,8 +1258,11 @@ func (r *EtcdClusterReconciler) updateStatus(ctx context.Context, s *reconcileSt
 				newStatus.Phase = ecv1alpha1.EtcdClusterPhaseRecovering
 			}
 		}
+		if cond.Type == string(ecv1alpha1.DataStoreReady) && s.dataStoreConditionSet {
+			setCondition(&newStatus.Conditions, cond, s.cluster.Generation)
+		}
 	}
-	if reflect.DeepEqual(s.cluster.Status, newStatus) {
+	if reflect.DeepEqual(s.cluster.Status, newStatus) && !s.recoveryConditionSet && !s.dataStoreConditionChanged && !s.readyGuardConditionSet {
 		return nil
 	}
 	patched := s.cluster.DeepCopy()
@@ -1351,16 +1379,16 @@ func (r *EtcdClusterReconciler) resolveDataStoreCASecret(ctx context.Context, ec
 func (r *EtcdClusterReconciler) reconcileDataStore(ctx context.Context, s *reconcileState) error {
 	name := dataStoreName(s.cluster)
 	if name == "" {
-		removeCondition(&s.cluster.Status.Conditions, ecv1alpha1.DataStoreReady)
+		removeDataStoreCondition(s)
 		return nil
 	}
 	if !isEtcdClusterReadyForDataStore(s) {
-		setCondition(&s.cluster.Status.Conditions, metav1.Condition{
+		setDataStoreCondition(s, metav1.Condition{
 			Type:    string(ecv1alpha1.DataStoreReady),
 			Status:  metav1.ConditionFalse,
 			Reason:  "EtcdClusterNotReady",
 			Message: "DataStore is not reconciled until EtcdCluster is Ready",
-		}, s.cluster.Generation)
+		})
 		return nil
 	}
 
@@ -1368,7 +1396,7 @@ func (r *EtcdClusterReconciler) reconcileDataStore(ctx context.Context, s *recon
 	current.SetGroupVersionKind(dataStoreGVK)
 	if err := r.Get(ctx, client.ObjectKey{Name: name}, current); err != nil {
 		if apimeta.IsNoMatchError(err) {
-			setCondition(&s.cluster.Status.Conditions, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionFalse, Reason: "DataStoreCRDNotFound", Message: "Kamaji DataStore CRD is not installed"}, s.cluster.Generation)
+			setDataStoreCondition(s, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionFalse, Reason: "DataStoreCRDNotFound", Message: "Kamaji DataStore CRD is not installed"})
 			return nil
 		}
 		if !errors.IsNotFound(err) {
@@ -1377,18 +1405,18 @@ func (r *EtcdClusterReconciler) reconcileDataStore(ctx context.Context, s *recon
 
 		caSecretName, caSecretNamespace, err := r.resolveDataStoreCASecret(ctx, s.cluster)
 		if err != nil {
-			setCondition(&s.cluster.Status.Conditions, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionFalse, Reason: "DataStoreCASecretUnavailable", Message: err.Error()}, s.cluster.Generation)
+			setDataStoreCondition(s, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionFalse, Reason: "DataStoreCASecretUnavailable", Message: err.Error()})
 			return nil
 		}
 		desired := desiredDataStore(s.cluster, name, caSecretName, caSecretNamespace)
 		if err := r.Create(ctx, desired); err != nil {
 			if apimeta.IsNoMatchError(err) {
-				setCondition(&s.cluster.Status.Conditions, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionFalse, Reason: "DataStoreCRDNotFound", Message: "Kamaji DataStore CRD is not installed"}, s.cluster.Generation)
+				setDataStoreCondition(s, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionFalse, Reason: "DataStoreCRDNotFound", Message: "Kamaji DataStore CRD is not installed"})
 				return nil
 			}
 			return err
 		}
-		setCondition(&s.cluster.Status.Conditions, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionTrue, Reason: "DataStoreReady", Message: fmt.Sprintf("DataStore %s created", name)}, s.cluster.Generation)
+		setDataStoreCondition(s, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionTrue, Reason: "DataStoreReady", Message: fmt.Sprintf("DataStore %s created", name)})
 		if r.Recorder != nil {
 			r.Recorder.Eventf(s.cluster, corev1.EventTypeNormal, "DataStoreReady", "Created DataStore %s", name)
 		}
@@ -1397,7 +1425,7 @@ func (r *EtcdClusterReconciler) reconcileDataStore(ctx context.Context, s *recon
 
 	caSecretName, caSecretNamespace, err := r.resolveDataStoreCASecret(ctx, s.cluster)
 	if err != nil {
-		setCondition(&s.cluster.Status.Conditions, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionFalse, Reason: "DataStoreCASecretUnavailable", Message: err.Error()}, s.cluster.Generation)
+		setDataStoreCondition(s, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionFalse, Reason: "DataStoreCASecretUnavailable", Message: err.Error()})
 		return nil
 	}
 	desired := desiredDataStore(s.cluster, name, caSecretName, caSecretNamespace)
@@ -1420,13 +1448,13 @@ func (r *EtcdClusterReconciler) reconcileDataStore(ctx context.Context, s *recon
 	if changed {
 		if err := r.Update(ctx, current); err != nil {
 			if apimeta.IsNoMatchError(err) {
-				setCondition(&s.cluster.Status.Conditions, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionFalse, Reason: "DataStoreCRDNotFound", Message: "Kamaji DataStore CRD is not installed"}, s.cluster.Generation)
+				setDataStoreCondition(s, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionFalse, Reason: "DataStoreCRDNotFound", Message: "Kamaji DataStore CRD is not installed"})
 				return nil
 			}
 			return err
 		}
 	}
-	setCondition(&s.cluster.Status.Conditions, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionTrue, Reason: "DataStoreReady", Message: fmt.Sprintf("DataStore %s is reconciled", name)}, s.cluster.Generation)
+	setDataStoreCondition(s, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionTrue, Reason: "DataStoreReady", Message: fmt.Sprintf("DataStore %s is reconciled", name)})
 	return nil
 }
 

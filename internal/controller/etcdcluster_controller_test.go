@@ -427,8 +427,13 @@ func TestValidateEtcdVersionUpgrade(t *testing.T) {
 		{name: "patch upgrade allowed", current: "3.5.17", desired: "3.5.18"},
 		{name: "adjacent minor upgrade allowed", current: "v3.5.17", desired: "v3.6.0"},
 		{name: "same version allowed", current: "3.5.17", desired: "3.5.17"},
+		{name: "suffixed desired patch upgrade allowed", current: "v3.5.21", desired: "v3.5.28-260421"},
+		{name: "suffixed patch upgrade allowed", current: "v3.5.21-100", desired: "v3.5.28-260421"},
+		{name: "build metadata patch upgrade allowed", current: "3.5.21+build.1", desired: "3.5.28+build.2"},
 		{name: "downgrade blocked", current: "3.5.17", desired: "3.5.16", wantErr: "downgrade"},
+		{name: "suffixed downgrade blocked", current: "v3.5.28-260421", desired: "v3.5.21-100", wantErr: "downgrade"},
 		{name: "cross minor blocked", current: "3.4.0", desired: "3.6.0", wantErr: "cross-minor"},
+		{name: "suffixed major change blocked", current: "v3.5.28-260421", desired: "v4.0.0-1", wantErr: "major version change"},
 		{name: "major change blocked", current: "3.5.17", desired: "4.0.0", wantErr: "major version change"},
 		{name: "invalid desired blocked", current: "3.5.17", desired: "bad", wantErr: "desired version"},
 	}
@@ -595,7 +600,7 @@ func TestUpdateStatusPreservesVersionUpgradeBlockedCondition(t *testing.T) {
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&ecv1alpha1.EtcdCluster{}).WithObjects(ec).Build()
 	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
 
-	err := r.updateStatus(ctx, &reconcileState{cluster: ec, sts: sts, memberListResp: members, memberHealth: health})
+	err := r.updateStatus(ctx, &reconcileState{cluster: ec, sts: sts, memberListResp: members, memberHealth: health, readyGuardConditionSet: true})
 
 	require.NoError(t, err)
 	updated := &ecv1alpha1.EtcdCluster{}
@@ -605,6 +610,32 @@ func TestUpdateStatusPreservesVersionUpgradeBlockedCondition(t *testing.T) {
 	assert.Equal(t, metav1.ConditionFalse, cond.Status)
 	assert.Equal(t, "EtcdVersionUpgradeBlocked", cond.Reason)
 	assert.Equal(t, ecv1alpha1.EtcdClusterPhaseDegraded, updated.Status.Phase)
+}
+
+func TestUpdateStatusDropsStaleReadyGuardCondition(t *testing.T) {
+	ctx := t.Context()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+	ec := statusTestCluster(3)
+	setCondition(&ec.Status.Conditions, metav1.Condition{Type: string(ecv1alpha1.EtcdClusterReady), Status: metav1.ConditionFalse, Reason: "EtcdVersionUpgradeBlocked", Message: "blocked"}, ec.Generation)
+	sts := statusTestStatefulSet(ec, 3)
+	members := statusMemberList(&etcdserverpb.Member{ID: 1, Name: "etcd-0"}, &etcdserverpb.Member{ID: 2, Name: "etcd-1"}, &etcdserverpb.Member{ID: 3, Name: "etcd-2"})
+	health := []etcdutils.EpHealth{epHealth("etcd-0", 1, true, 1), epHealth("etcd-1", 2, true, 1), epHealth("etcd-2", 3, true, 1)}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&ecv1alpha1.EtcdCluster{}).WithObjects(ec).Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+	err := r.updateStatus(ctx, &reconcileState{cluster: ec, sts: sts, memberListResp: members, memberHealth: health})
+
+	require.NoError(t, err)
+	updated := &ecv1alpha1.EtcdCluster{}
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, updated))
+	cond := conditionByType(updated.Status.Conditions, ecv1alpha1.EtcdClusterReady)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, "ClusterReady", cond.Reason)
+	assert.Equal(t, ecv1alpha1.EtcdClusterPhaseReady, updated.Status.Phase)
 }
 
 func TestUpdateStatusPreservesActiveRecoveryCondition(t *testing.T) {
@@ -657,6 +688,90 @@ func TestUpdateStatusPreservesBlockedRecoveryConditionReason(t *testing.T) {
 	assert.Equal(t, metav1.ConditionFalse, cond.Status)
 	assert.Equal(t, "NoSpaceAlarm", cond.Reason)
 	assert.Equal(t, "blocked", cond.Message)
+}
+
+func TestUpdateStatusPersistsDataStoreConditionSetDuringReconcile(t *testing.T) {
+	ctx := t.Context()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+	ec := statusTestCluster(3)
+	sts := statusTestStatefulSet(ec, 3)
+	members := statusMemberList(&etcdserverpb.Member{ID: 1, Name: "etcd-0"}, &etcdserverpb.Member{ID: 2, Name: "etcd-1"}, &etcdserverpb.Member{ID: 3, Name: "etcd-2"})
+	health := []etcdutils.EpHealth{epHealth("etcd-0", 1, true, 1), epHealth("etcd-1", 2, true, 1), epHealth("etcd-2", 3, true, 1)}
+	ec.Status = buildClusterStatus(ec, sts, nil, members, health)
+	setCondition(&ec.Status.Conditions, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionFalse, Reason: "EtcdClusterNotReady", Message: "DataStore is not reconciled until EtcdCluster is Ready"}, ec.Generation)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&ecv1alpha1.EtcdCluster{}).WithObjects(ec).Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+	local := &ecv1alpha1.EtcdCluster{}
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, local))
+	setCondition(&local.Status.Conditions, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionTrue, Reason: "DataStoreReady", Message: "DataStore hcp-etcd is reconciled"}, local.Generation)
+
+	err := r.updateStatus(ctx, &reconcileState{cluster: local, sts: sts, memberListResp: members, memberHealth: health, dataStoreConditionSet: true})
+
+	require.NoError(t, err)
+	updated := &ecv1alpha1.EtcdCluster{}
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, updated))
+	cond := conditionByType(updated.Status.Conditions, ecv1alpha1.DataStoreReady)
+	require.NotNil(t, cond)
+	assert.Equal(t, metav1.ConditionTrue, cond.Status)
+	assert.Equal(t, "DataStoreReady", cond.Reason)
+	assert.Equal(t, "DataStore hcp-etcd is reconciled", cond.Message)
+}
+
+func TestUpdateStatusPreservesUnchangedDataStoreConditionSetDuringReconcile(t *testing.T) {
+	ctx := t.Context()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+	ec := statusTestCluster(3)
+	sts := statusTestStatefulSet(ec, 3)
+	members := statusMemberList(&etcdserverpb.Member{ID: 1, Name: "etcd-0"}, &etcdserverpb.Member{ID: 2, Name: "etcd-1"}, &etcdserverpb.Member{ID: 3, Name: "etcd-2"})
+	health := []etcdutils.EpHealth{epHealth("etcd-0", 1, true, 1), epHealth("etcd-1", 2, true, 1), epHealth("etcd-2", 3, true, 1)}
+	ec.Status = buildClusterStatus(ec, sts, nil, members, health)
+	cond := metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionTrue, Reason: "DataStoreReady", Message: "DataStore hcp-etcd is reconciled"}
+	setCondition(&ec.Status.Conditions, cond, ec.Generation)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&ecv1alpha1.EtcdCluster{}).WithObjects(ec).Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+	local := &ecv1alpha1.EtcdCluster{}
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, local))
+	state := &reconcileState{cluster: local, sts: sts, memberListResp: members, memberHealth: health}
+	setDataStoreCondition(state, cond)
+
+	err := r.updateStatus(ctx, state)
+
+	require.NoError(t, err)
+	updated := &ecv1alpha1.EtcdCluster{}
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, updated))
+	updatedCond := conditionByType(updated.Status.Conditions, ecv1alpha1.DataStoreReady)
+	require.NotNil(t, updatedCond)
+	assert.Equal(t, metav1.ConditionTrue, updatedCond.Status)
+	assert.Equal(t, "DataStoreReady", updatedCond.Reason)
+}
+
+func TestUpdateStatusDropsStaleDataStoreConditionWhenNotSetDuringReconcile(t *testing.T) {
+	ctx := t.Context()
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+	_ = ecv1alpha1.AddToScheme(scheme)
+	ec := statusTestCluster(3)
+	sts := statusTestStatefulSet(ec, 3)
+	members := statusMemberList(&etcdserverpb.Member{ID: 1, Name: "etcd-0"}, &etcdserverpb.Member{ID: 2, Name: "etcd-1"}, &etcdserverpb.Member{ID: 3, Name: "etcd-2"})
+	health := []etcdutils.EpHealth{epHealth("etcd-0", 1, true, 1), epHealth("etcd-1", 2, true, 1), epHealth("etcd-2", 3, true, 1)}
+	ec.Status = buildClusterStatus(ec, sts, nil, members, health)
+	setCondition(&ec.Status.Conditions, metav1.Condition{Type: string(ecv1alpha1.DataStoreReady), Status: metav1.ConditionTrue, Reason: "DataStoreReady", Message: "stale"}, ec.Generation)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&ecv1alpha1.EtcdCluster{}).WithObjects(ec).Build()
+	r := &EtcdClusterReconciler{Client: fakeClient, Scheme: scheme}
+
+	err := r.updateStatus(ctx, &reconcileState{cluster: ec, sts: sts, memberListResp: members, memberHealth: health})
+
+	require.NoError(t, err)
+	updated := &ecv1alpha1.EtcdCluster{}
+	require.NoError(t, fakeClient.Get(ctx, client.ObjectKey{Name: ec.Name, Namespace: ec.Namespace}, updated))
+	assert.Nil(t, conditionByType(updated.Status.Conditions, ecv1alpha1.DataStoreReady))
 }
 
 func TestIsVersionUpgradeAllowedSetsConditionAndEventOnBlockedUpgrade(t *testing.T) {
